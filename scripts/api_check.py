@@ -15,9 +15,11 @@ import uuid
 try:
     from .deployment import MODEL_NAME, read_env, validate_limits
     from .vision_input import COLORS, image_content, solid_image
+    from .progress import BenchmarkProgress
 except ImportError:
     from deployment import MODEL_NAME, read_env, validate_limits
     from vision_input import COLORS, image_content, solid_image
+    from progress import BenchmarkProgress
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -110,13 +112,16 @@ def percentile(values, fraction):
 
 
 def stream_request(client, model, messages, max_tokens, min_tokens, gate, number,
-                   first_event, wait_for, deadline, epoch):
+                   first_event, wait_for, deadline, epoch, progress=None):
+    progress = progress or BenchmarkProgress()
+    progress.request(number, status='waiting for long sessions' if wait_for else 'ready')
     gate.wait(timeout=30)
     # In the mixed test, extra users arrive only after both long sessions start decoding.
     for event in wait_for:
         if not event.wait(max(0, deadline - time.monotonic())):
             raise RuntimeError('Timed out waiting for the long sessions to begin generating')
     start = time.monotonic()
+    progress.request(number, status='waiting for first output (queued or prefill)')
     stamps, usage, finish, output, done = [], None, None, '', False
     body = {'model': model, 'messages': messages, 'max_tokens': max_tokens,
             'min_tokens': min_tokens, 'temperature': 1.0, 'top_p': 0.95,
@@ -145,6 +150,7 @@ def stream_request(client, model, messages, max_tokens, min_tokens, gate, number
                 text = (delta.get('reasoning_content') or '') + (delta.get('content') or '')
                 if text:
                     stamps.append(now)
+                    progress.output(number)
                     first_event.set()
                     if len(output) < 160:
                         output += text[:160 - len(output)]
@@ -157,6 +163,7 @@ def stream_request(client, model, messages, max_tokens, min_tokens, gate, number
     count = usage.get('completion_tokens', 0)
     if count < min_tokens:
         raise RuntimeError(f'Only {count} output tokens; at least {min_tokens} required')
+    progress.request(number, status='completed', completion_tokens=count)
     gaps = [b - a for a, b in zip(stamps, stamps[1:])]
     duration = stamps[-1] - stamps[0]
     return {'request': number, 'started_s': start - epoch, 'first_output_s': stamps[0] - epoch,
@@ -225,7 +232,8 @@ def vision_check(client, model, image_size=1024):
             'image_dimensions': [image_size, image_size], 'results': results, 'quality_evaluation': False}
 
 
-def run_check(args, root=ROOT):
+def run_check(args, root=ROOT, progress=None):
+    progress = progress or BenchmarkProgress()
     env = read_env(root)
     url = args.url or f'http://127.0.0.1:{env.get("API_PORT", "5000")}'
     keys = json.loads((root / 'secrets/api_tokens.yml').read_text())['api_key']
@@ -240,11 +248,13 @@ def run_check(args, root=ROOT):
     params = model['parameters']
     validate_limits(params)
     if args.mode == 'vision':
+        progress.stage('Checking two image probes')
         return vision_check(clients[0], model, args.image_size)
     with_images = args.with_images
     if with_images and (args.mode != 'mixed' or params.get('use_vision') is not True):
         raise RuntimeError('--with-images requires mixed mode and loaded vision support')
     if args.mode == 'smoke':
+        progress.stage('Waiting for text smoke response')
         result = clients[0].json('/v1/chat/completions', {'model': model['id'],
             'messages': [{'role': 'user', 'content': 'Reply with READY.'}], 'max_tokens': 512,
             'temperature': 1.0, 'top_p': .95, 'reasoning_effort': 'low'})
@@ -256,6 +266,7 @@ def run_check(args, root=ROOT):
         raise RuntimeError('This concurrency benchmark needs enough active slots; queued requests are a separate test')
     if args.mode == 'mixed' and users < 3:
         raise RuntimeError('Mixed test requires at least three users')
+    progress.stage('Calibrating chat token counts')
     offset = clients[0].calibrate_prompt_count(model['id'])
     for client in clients:
         client.prompt_token_offset = offset
@@ -270,7 +281,10 @@ def run_check(args, root=ROOT):
             raise RuntimeError('Input plus output and checkpoint margin exceeds context')
         color = list(COLORS)[i % len(COLORS)] if extra and with_images else None
         image_url = solid_image(color, size=args.image_size) if color else None
+        progress.stage(f'Preparing and tokenizing request {i+1}/{users} (target {target:,} tokens)')
+        progress.request(i+1, status='preparing')
         messages, count = make_prompt(client, target, max_input, corpus, image_url)
+        progress.request(i+1, status='prepared', input_tokens=count)
         if image_url:
             # Same pixels and token geometry, new URL: encode must run again at
             # timed arrival rather than hitting the cache warmed by token counting.
@@ -282,20 +296,23 @@ def run_check(args, root=ROOT):
     allocation = sum(((c + o + 2047) // 2048) * 2048 for c, o in zip(counts, maximums))
     if allocation > params['cache_size']:
         raise RuntimeError('Benchmark requests exceed shared cache; reduce the test workload or raise the measured cache budget')
+    progress.stage(f'Streaming {users} requests')
     epoch = time.monotonic(); deadline = epoch + args.timeout
     gate = threading.Barrier(users); first_events = [threading.Event() for _ in clients]
     errors, results = [], []
     with ThreadPoolExecutor(max_workers=users) as pool:
         futures = [pool.submit(stream_request, client, model['id'], prompts[i], maximums[i], minimums[i],
                    gate, i+1, first_events[i], first_events[:2] if args.mode == 'mixed' and i >= 2 else [],
-                   deadline, epoch) for i, client in enumerate(clients)]
+                   deadline, epoch, progress) for i, client in enumerate(clients)]
         for i, future in enumerate(futures):
             try:
                 results.append(future.result())
             except Exception as exc:
                 errors.append(f'Request {i+1}: {exc}')
+                progress.request(i+1, status='failed')
                 # Release dependencies promptly; the failed test is still recorded as failed.
                 first_events[i].set()
+    progress.stage('Checking overlap, token counts and backend health')
     report = {'status': 'failed' if errors else 'passed', 'test': args.mode, 'parameters': params,
               'model': model['id'], 'users': users, 'prepared_input_tokens': counts,
               'chat_template_token_offset': offset, 'extra_sessions_include_images': with_images,
@@ -327,6 +344,7 @@ def main():
     parser.add_argument('--short-output', type=int, default=256)
     parser.add_argument('--timeout', type=int, default=7200, help='Wall-clock streaming budget in seconds')
     parser.add_argument('--corpus', type=Path, help='Optional representative UTF-8 text/code to repeat in the prompt')
+    parser.add_argument('--progress-json', type=Path, help='Live activity snapshot for the tuner; contains no prompt/output text')
     parser.add_argument('--report', type=Path, default=ROOT / 'reports/api-check.json')
     args = parser.parse_args()
     if not 28 <= args.image_size <= 4096:
@@ -335,10 +353,12 @@ def main():
         parser.error('All limits must be positive')
     if args.min_output is not None and not 1 <= args.min_output <= args.max_output:
         parser.error('min-output must be between 1 and max-output')
-    try:
-        report = run_check(args)
-    except Exception as exc:
-        report = {'status': 'failed', 'test': args.mode, 'errors': [str(exc)]}
+    with BenchmarkProgress(args.progress_json) as progress:
+        try:
+            report = run_check(args, progress=progress)
+        except Exception as exc:
+            report = {'status': 'failed', 'test': args.mode, 'errors': [str(exc)]}
+        progress.finish(report['status'])
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps({k: v for k, v in report.items() if k not in {'results', 'result'}}, indent=2))

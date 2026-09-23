@@ -117,11 +117,14 @@ class RankingTests(unittest.TestCase):
 
     def test_failed_fastest_boundary_falls_back(self):
         tuner = autotune.Tuner.__new__(autotune.Tuner)
+        tuner.progress = Mock()
         tuner.args = argparse.Namespace(modes=['nccl', 'native'], chunks=[2048], draft_tokens=[0], no_expand=True)
         tuner.report = {'records': []}; tuner.root = ROOT; tuner.directory = ROOT / 'reports/test'
         def evaluate(profile):
             value = record(profile.mode, speed=40 if profile.mode == 'nccl' else 20)
+            value['elapsed_s'] = 10
             tuner.report['records'].append(value)
+            return value
         tuner.evaluate = evaluate; tuner.stop = Mock(); tuner.save = Mock(); tuner.start = Mock()
         tuner.check = Mock(); tuner.restore = Mock()
         tuner.boundary = Mock(side_effect=[RuntimeError('OOM near ceiling'), {'ok': True}])
@@ -132,6 +135,7 @@ class RankingTests(unittest.TestCase):
 
     def test_interruption_restores_previous_service(self):
         tuner = autotune.Tuner.__new__(autotune.Tuner)
+        tuner.progress = Mock()
         tuner.args = argparse.Namespace(modes=['nccl'], chunks=[2048], draft_tokens=[0])
         tuner.report = {'records': []}; tuner.evaluate = Mock(side_effect=KeyboardInterrupt)
         tuner.save = Mock(); tuner.restore = Mock()
@@ -143,6 +147,7 @@ class RankingTests(unittest.TestCase):
     def test_restore_preserves_original_config_and_stopped_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             tuner = autotune.Tuner.__new__(autotune.Tuner)
+            tuner.progress = Mock()
             tuner.root = Path(tmp); tuner.stop = Mock(); tuner.wait_healthy = Mock()
             tuner.was_running = False; tuner.originals = {'config.yml': b'original: value\n', 'deployment.json': None}
             (tuner.root / 'config.yml').write_text('candidate')

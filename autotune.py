@@ -17,6 +17,7 @@ import threading
 import time
 
 from scripts.deployment import Profile, atomic_write, read_env, write_profile
+from scripts.progress import TuningProgress, duration
 
 ROOT = Path(__file__).resolve().parent
 WEIGHTS = {'ttft': .25, 'decode_cost': .45, 'extra_ttft': .20, 'pause': .10}
@@ -31,6 +32,36 @@ def run(command, *, root=ROOT, timeout=120):
 
 def compose(*args, root=ROOT, timeout=120):
     return run(['docker', 'compose', *args], root=root, timeout=timeout)
+
+
+def run_logged(command, *, root, log, timeout):
+    """Persist child output and ensure interruption/timeout cannot leave a benchmark running."""
+    with log.open('w') as output:
+        process = subprocess.Popen(command, cwd=root, stdout=output, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+        try:
+            return process.wait(timeout=timeout)
+        except BaseException:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+            raise
+
+
+def metrics_text(report):
+    metrics = report.get('metrics', {})
+    if not metrics:
+        return 'PASS'
+    text = (f'PASS | worst TTFT {metrics["worst_ttft_s"]:.1f}s | '
+            f'slower session {metrics["worst_decode_tokens_per_s"]:.2f} tokens/s | '
+            f'longest output pause {metrics["worst_max_stream_gap_s"]:.2f}s | '
+            f'overlap {100 * metrics["generation_overlap_fraction"]:.0f}%')
+    if 'extra_user_worst_ttft_s' in metrics:
+        text += f' | extra-session TTFT {metrics["extra_user_worst_ttft_s"]:.1f}s'
+    return text
 
 
 def costs(record):
@@ -126,21 +157,26 @@ class Tuner:
                        'host': run(['nvidia-smi', '--query-gpu=uuid,name,driver_version,memory.total', '--format=csv']),
                        'topology': run(['nvidia-smi', 'topo', '-m']),
                        'arguments': {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}}
+        total = len(args.modes) * len(args.chunks) * len(args.draft_tokens)
+        self.progress = TuningProgress(self.directory, total, args.progress_interval)
         self.save()
 
     def save(self):
         atomic_write(self.directory / 'summary.json', json.dumps(self.report, indent=2) + '\n')
 
     def stop(self):
+        self.progress.set(stage='Stopping server')
         compose('stop', '-t', '30', 'server', root=self.root, timeout=60)
 
     def start(self, profile):
         self.stop()
         write_profile(self.root, profile, selected_by='autotune-candidate')
+        self.progress.set(stage='Starting container', candidate=profile.name)
         compose('up', '-d', '--no-build', '--pull', 'never', '--force-recreate', 'server', root=self.root)
         self.wait_healthy()
 
     def wait_healthy(self):
+        self.progress.set(stage='Loading model and warming kernels; waiting for healthy status')
         deadline = time.monotonic() + self.args.startup_timeout
         cid = compose('ps', '-aq', 'server', root=self.root)
         if not cid:
@@ -151,6 +187,7 @@ class Tuner:
                 raise RuntimeError('Candidate exited or restarted during loading; inspect server logs locally')
             status = state.get('Health', {}).get('Status')
             if status == 'healthy':
+                self.progress.emit('Server healthy')
                 return
             if status == 'unhealthy':
                 raise RuntimeError('Candidate healthcheck failed')
@@ -159,29 +196,38 @@ class Tuner:
 
     def check(self, profile, kind, trial, *, tokens=None, output=None, users=None):
         path = self.directory / f'{profile.name}-{trial}-{kind}.json'
+        label = f'{kind} test {trial+1}/{self.args.repeats}' if isinstance(trial, int) else f'{kind}: {trial}'
+        self.progress.set(stage=label)
+        activity = self.directory / 'benchmark-progress.json'
+        activity.unlink(missing_ok=True)
+        self.progress.follow(activity)
         command = [sys.executable, 'scripts/api_check.py', kind, '--tokens', str(tokens or self.args.tokens),
                    '--max-output', str(output or self.args.output_tokens), '--users', str(users or (profile.max_batch_size if kind == 'mixed' else 2)),
                    '--timeout', str(self.args.request_timeout), '--report', str(path),
-                   '--reasoning-effort', self.args.reasoning_effort, '--image-size', str(self.args.image_size)]
+                   '--reasoning-effort', self.args.reasoning_effort, '--image-size', str(self.args.image_size),
+                   '--progress-json', str(activity)]
         if kind == 'mixed' and profile.vision:
             command.append('--with-images')
         if self.args.corpus:
             command.extend(['--corpus', str(self.args.corpus.resolve())])
         # Includes a separate allowance for prompt construction/tokenization.
-        result = subprocess.run(command, cwd=self.root, text=True, capture_output=True,
-                                timeout=self.args.request_timeout + 900)
+        log = path.with_suffix('.log')
+        code = run_logged(command, root=self.root, log=log, timeout=self.args.request_timeout + 900)
         if not path.exists():
-            raise RuntimeError('Benchmark produced no report: ' + result.stderr[-1000:])
+            raise RuntimeError(f'Benchmark produced no report; see {log}')
         report = json.loads(path.read_text())
-        if result.returncode or report.get('status') != 'passed':
-            raise RuntimeError(f'{kind} check failed: {report.get("errors", result.stderr[-1000:])}')
+        if code or report.get('status') != 'passed':
+            raise RuntimeError(f'{kind} check failed: {report.get("errors", [])}; details: {log}')
+        self.progress.set(metrics=report.get('metrics', {}), message=metrics_text(report))
         report['report_file'] = str(path.relative_to(self.root))
         return report
 
     def evaluate(self, profile):
-        record = {'profile': asdict(profile), 'name': profile.name, 'status': 'failed', 'trials': []}
+        started = time.monotonic()
+        record = {'profile': asdict(profile), 'name': profile.name, 'status': 'running', 'trials': []}
         self.report['records'].append(record)
-        print(f'Testing {profile.name}', flush=True)
+        self.progress.set(stage='Preparing candidate', candidate=profile.name)
+        self.save()
         try:
             # Watch loading too: reserve must survive all measured stages.
             self.stop()
@@ -202,14 +248,24 @@ class Tuner:
                 raise RuntimeError('Insufficient measured per-GPU VRAM headroom')
             record['status'] = 'passed'
         except (RuntimeError, subprocess.SubprocessError, OSError, ValueError) as exc:
+            record['status'] = 'failed'
             record['error'] = str(exc)
-            print(f'  Rejected: {exc}', flush=True)
+            self.progress.emit(f'Rejected: {exc}')
         finally:
-            self.stop()
-            self.save()
+            try:
+                self.stop()
+            finally:
+                record['elapsed_s'] = time.monotonic() - started
+                if record['status'] == 'running':
+                    record['status'] = 'interrupted'
+                self.save()
+        if record['status'] == 'passed':
+            free = min(v['minimum_free_mib'] for v in record['gpu_memory'].values()) / 1024
+            self.progress.emit(f'Candidate passed in {duration(record["elapsed_s"])}; minimum sampled free VRAM {free:.2f} GiB')
         return record
 
     def boundary(self, profile):
+        self.progress.set(phase='context boundary', stage=f'Checking {profile.max_seq_len:,}-token context', candidate=profile.name)
         # Exercise the advertised ceiling, not just the two-user target. This is a capacity check.
         self.stop()
         with GPUWatch(self.uuids) as watch:
@@ -222,6 +278,7 @@ class Tuner:
         return {'report_file': report['report_file'], 'gpu_memory': memory}
 
     def restore(self):
+        self.progress.set(phase='restoring', stage='Restoring original configuration and service state')
         self.stop()
         for name, data in self.originals.items():
             path = self.root / name
@@ -236,9 +293,13 @@ class Tuner:
     def optimize(self, base):
         success = False
         try:
-            for mode, chunk, draft in itertools.product(self.args.modes, self.args.chunks, self.args.draft_tokens):
+            matrix = itertools.product(self.args.modes, self.args.chunks, self.args.draft_tokens)
+            for index, (mode, chunk, draft) in enumerate(matrix, 1):
                 profile = replace(base, mode=mode, chunk_size=chunk, draft_tokens=draft).validate()
-                self.evaluate(profile)
+                self.progress.set(phase='matrix', stage='Beginning candidate', candidate=profile.name, index=index)
+                record = self.evaluate(profile)
+                self.progress.complete_candidate(record['status'] == 'passed', record['elapsed_s'])
+            self.progress.set(phase='ranking', stage='Ranking eligible configurations')
             ranked = rank_profiles(self.report['records'])
             winner = None
             for candidate in ranked:
@@ -249,6 +310,7 @@ class Tuner:
                     break
                 except (RuntimeError, subprocess.SubprocessError, OSError, ValueError) as exc:
                     candidate['status'] = 'failed'; candidate['boundary_error'] = str(exc)
+                    self.progress.emit(f'Context check failed; trying next candidate: {exc}')
                     self.stop(); self.save()
             if winner is None:
                 raise RuntimeError('No configuration passed the capacity, concurrency and context-boundary checks')
@@ -256,6 +318,7 @@ class Tuner:
             if not self.args.no_expand and base.max_seq_len < 1048576:
                 expanded = replace(Profile(**winner['profile']), max_seq_len=1048576,
                                    cache_size=max(base.cache_size, 1572864))
+                self.progress.set(phase='context expansion', stage='Testing larger cache/context', candidate=expanded.name)
                 larger = self.evaluate(expanded)
                 if larger['status'] == 'passed' and no_material_regression(larger, winner, self.args.expansion_tolerance):
                     try:
@@ -263,10 +326,13 @@ class Tuner:
                         winner = larger
                     except (RuntimeError, subprocess.SubprocessError, OSError, ValueError) as exc:
                         larger['status'] = 'failed'; larger['boundary_error'] = str(exc)
+                        self.progress.emit(f'Expanded context rejected: {exc}')
                 else:
                     larger['selected'] = False
                     larger['selection_note'] = 'Capacity failure or material target-workload latency/throughput regression'
+                    self.progress.emit('Keeping smaller context: expansion failed or regressed')
             selected = Profile(**winner['profile'])
+            self.progress.set(phase='final validation', stage='Starting selected configuration', candidate=selected.name)
             self.start(selected)
             self.check(selected, 'smoke', 'selected')
             if selected.vision:
@@ -276,7 +342,8 @@ class Tuner:
             self.report['status'] = 'selected'; self.report['selected'] = asdict(selected)
             self.report['selection_scope'] = 'Best measured eligible candidate for this workload; not a universal optimum'
             self.save(); success = True
-            print(f'Selected {selected.name}\nEvidence: {evidence}', flush=True)
+            self.progress.set(phase='complete', stage='Selected configuration is running', status='selected')
+            self.progress.emit(f'Selected {selected.name}; evidence: {evidence}')
         finally:
             if not success:
                 self.report['status'] = 'restoring-original'
@@ -284,9 +351,12 @@ class Tuner:
                 try:
                     self.restore()
                     self.report['status'] = 'failed-original-restored'
+                    self.progress.set(phase='stopped', stage='Run did not complete; original configuration restored', status='failed-original-restored')
                 except Exception as exc:
                     self.report['status'] = 'failed-restore-needs-attention'
                     self.report['restore_error'] = str(exc)
+                    self.progress.set(phase='failed', stage='Restoration needs attention', status='failed-restore-needs-attention')
+                    self.progress.emit(str(exc))
                     raise
                 finally:
                     self.save()
@@ -308,8 +378,11 @@ def main():
     parser.add_argument('--corpus', type=Path)
     parser.add_argument('--reasoning-effort', choices=['low', 'high', 'max'], default='max')
     parser.add_argument('--image-size', type=int, default=1024, help='Square image side for vision probes and mixed arrivals')
+    parser.add_argument('--progress-interval', type=int, default=15, help='Seconds between live terminal/status updates (5–300)')
     parser.add_argument('--plan', action='store_true', help='Print the experiment matrix; do not touch Docker or config')
     args = parser.parse_args()
+    if not 5 <= args.progress_interval <= 300:
+        parser.error('progress-interval must be 5–300 seconds')
     if not 28 <= args.image_size <= 4096:
         parser.error('image-size must be between 28 and 4096 pixels')
     if args.repeats < 1 or args.tokens < 260000 or args.output_tokens < 4096:
@@ -336,7 +409,8 @@ def main():
         base = Profile(**record['profile']).validate()
         print('Maintenance run: disconnect clients. The server will restart between candidates. No models/images are downloaded.', flush=True)
         tuner = Tuner(args)
-        tuner.optimize(base)
+        with tuner.progress:
+            tuner.optimize(base)
     return 0
 
 

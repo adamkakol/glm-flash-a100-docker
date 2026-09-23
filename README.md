@@ -235,6 +235,55 @@ not a universal optimum. Re-run after changing the model, engine, driver,
 GPU placement or workload. It does not switch allocation mode during live
 requests or change precision/reasoning quality to improve its score.
 
+## Watching a tuning run
+
+Progress reporting is automatic. The terminal shows a configuration-count bar,
+the current candidate and phase, the current test/repetition, total elapsed time,
+and time spent in the current stage. It prints on stage changes and every **15
+seconds**, including while the server loads or a benchmark waits for output.
+Use `--progress-interval 5` for more frequent updates (allowed range 5–300 seconds).
+The newline-based display also works over SSH and when redirected to a log.
+
+During a benchmark, each request is shown as preparing, waiting for the long
+sessions, waiting for first output, generating, completed, or failed. Input token
+counts, received output-event counts, and time since the last output help show
+activity. A separate snapshot age makes stale child-process reporting visible.
+Waiting for first output can mean queueing or prefill; the API does not expose
+an exact prefill percentage. Live output events are **not** exact token counts,
+since one SSE event can contain multiple tokens. Final token counts come from
+the server's usage report.
+
+After each test, the display prints pass/fail information and, where applicable,
+worst time to first output, the slower session's tokens/second, the longest output
+pause, overlap, and extra-session latency. Candidate completion also reports
+minimum sampled free VRAM. A matrix ETA appears after two successful candidates;
+it uses their median duration and is approximate. It excludes later context
+boundary checks, context expansion, and final validation. **100% of configurations
+tested does not mean the entire tuning run has finished**: those later phases
+are labelled separately, and the final state confirms selection or restoration.
+
+The run directory printed at startup contains:
+
+- `progress.log`: the same readable status history shown in the terminal.
+- `progress.json`: the latest overall status, activity and last completed-test
+  metrics, with their candidate/stage labels.
+- `benchmark-progress.json`: the current benchmark's activity, refreshed every
+  two seconds without writing prompt or generated text.
+- Per-test `.log` files beside the existing JSON reports: captured checker output
+  and errors, so failures can be inspected after the run.
+
+To follow an existing run from a second terminal, use its printed directory:
+
+```bash
+tail -f reports/autotune-<run-id>/progress.log
+```
+
+Use `tmux` or an equivalent persistent terminal for a long run if you may
+disconnect SSH. This is progress reporting, not automatic resume after a machine
+restart. Normal interruption/timeout stops the active checker before the tuner
+restores its prior configuration; the existing SIGKILL/power-loss limitation
+still applies.
+
 ## Images and video
 
 Vision is enabled with `vision_offload=false`: the encoder is loaded onto GPUs

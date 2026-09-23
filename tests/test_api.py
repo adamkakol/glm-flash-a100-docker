@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / 'scripts'))
 from scripts import api_check, media_chat
 from scripts.deployment import MODEL_NAME
 from scripts.vision_input import COLORS, solid_image
+from scripts.progress import BenchmarkProgress
 
 
 def png_pixel(url):
@@ -116,9 +117,16 @@ class HTTPTests(unittest.TestCase):
             (root / 'secrets/api_tokens.yml').write_text(json.dumps({'api_key': ['fixture']}))
             for mode in ['smoke', 'vision', 'long', 'mixed']:
                 with self.subTest(mode=mode), patch('builtins.print'):
-                    report = api_check.run_check(self.args(mode), root)
+                    with BenchmarkProgress(root / 'activity.json', interval=.01) as progress:
+                        report = api_check.run_check(self.args(mode), root, progress)
+                        progress.finish(report['status'])
+                    activity = json.loads((root / 'activity.json').read_text())
+                    self.assertEqual(activity['status'], 'passed')
                     self.assertEqual(report['status'], 'passed', report.get('errors'))
                     if mode in {'long', 'mixed'}:
+                        self.assertEqual(activity['requests']['1']['status'], 'completed')
+                        self.assertEqual(activity['requests']['1']['output_events'], 30)
+                        self.assertEqual(activity['requests']['1']['completion_tokens'], 4096)
                         self.assertEqual(report['chat_template_token_offset'], 5)
                         self.assertGreater(report['metrics']['generation_overlap_fraction'], .1)
                         self.assertGreater(report['results'][0]['decode_tokens_per_s'], 0)

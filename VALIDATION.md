@@ -1,10 +1,10 @@
 # Validation record — 2026-09-23
 
 This revision adds a shared-cache policy, performance-based hardware tuner,
-image input and stricter NVLink topology checks.
+image input, stricter NVLink topology checks, and live tuning progress.
 No A100 benchmark result or universally fastest profile is claimed.
 
-Completed for this update (29 passing CPU tests):
+Completed for this update (37 passing CPU tests):
 
 - CPU-only unit tests for shared cache with more than two active slots, context
   guards, all config modes and draft settings, and preservation of GPU UUIDs,
@@ -29,6 +29,12 @@ Completed for this update (29 passing CPU tests):
   mapping, and rejection of asymmetric/missing links or the wrong pair.
 - Real FFmpeg extraction from a tiny locally generated synthetic video, testing
   bounded sampling, timestamped embedded frames, and cleanup. This loads no model.
+- Progress heartbeats during quiet subprocesses, honest matrix percentages/ETA,
+  stale snapshot reporting, and completed-test metric display.
+- Real child-process timeout cleanup, interruption/kill escalation, and the
+  existing configuration-restoration tests.
+- Stream progress callbacks exercised by the mock HTTP/SSE tests; live events
+  are kept separate from authoritative final token counts.
 - Python syntax and CLI plan checks, plus upstream configuration/schema review.
 
 The existing immutable upstream pins remain unchanged. The initial review also

@@ -162,7 +162,9 @@ class Tuner:
         command = [sys.executable, 'scripts/api_check.py', kind, '--tokens', str(tokens or self.args.tokens),
                    '--max-output', str(output or self.args.output_tokens), '--users', str(users or (profile.max_batch_size if kind == 'mixed' else 2)),
                    '--timeout', str(self.args.request_timeout), '--report', str(path),
-                   '--reasoning-effort', self.args.reasoning_effort]
+                   '--reasoning-effort', self.args.reasoning_effort, '--image-size', str(self.args.image_size)]
+        if kind == 'mixed' and profile.vision:
+            command.append('--with-images')
         if self.args.corpus:
             command.extend(['--corpus', str(self.args.corpus.resolve())])
         # Includes a separate allowance for prompt construction/tokenization.
@@ -186,6 +188,9 @@ class Tuner:
             with GPUWatch(self.uuids) as watch:
                 self.start(profile)
                 self.check(profile, 'smoke', 'warmup')
+                if profile.vision:
+                    vision = self.check(profile, 'vision', 'warmup')
+                    record['vision_report'] = vision['report_file']
                 for trial in range(self.args.repeats):
                     long = self.check(profile, 'long', trial)
                     mixed = self.check(profile, 'mixed', trial)
@@ -264,6 +269,8 @@ class Tuner:
             selected = Profile(**winner['profile'])
             self.start(selected)
             self.check(selected, 'smoke', 'selected')
+            if selected.vision:
+                self.check(selected, 'vision', 'selected')
             evidence = str(self.directory.relative_to(self.root) / 'summary.json')
             write_profile(self.root, selected, selected_by='measured-autotune', evidence=evidence)
             self.report['status'] = 'selected'; self.report['selected'] = asdict(selected)
@@ -300,8 +307,11 @@ def main():
     parser.add_argument('--expansion-tolerance', type=float, default=.05)
     parser.add_argument('--corpus', type=Path)
     parser.add_argument('--reasoning-effort', choices=['low', 'high', 'max'], default='max')
+    parser.add_argument('--image-size', type=int, default=1024, help='Square image side for vision probes and mixed arrivals')
     parser.add_argument('--plan', action='store_true', help='Print the experiment matrix; do not touch Docker or config')
     args = parser.parse_args()
+    if not 28 <= args.image_size <= 4096:
+        parser.error('image-size must be between 28 and 4096 pixels')
     if args.repeats < 1 or args.tokens < 260000 or args.output_tokens < 4096:
         parser.error('Acceptance tuning requires >=1 repeat, >=260000 input tokens and >=4096 output tokens')
     if args.min_free_mib < 2048 or min(args.startup_timeout, args.request_timeout) < 30:
@@ -312,7 +322,7 @@ def main():
         print(json.dumps({'candidates': list(itertools.product(args.modes, args.chunks, args.draft_tokens)),
                           'repeats': args.repeats, 'input_per_long_session': args.tokens,
                           'output_per_long_session': args.output_tokens, 'weights': WEIGHTS,
-                          'expand_context_if_efficient': not args.no_expand}, indent=2))
+                          'expand_context_if_efficient': not args.no_expand, 'vision_test_image_size': args.image_size}, indent=2))
         return 0
     def interrupted(signum, frame):
         raise KeyboardInterrupt(f'Signal {signum}')

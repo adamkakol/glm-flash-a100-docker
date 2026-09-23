@@ -11,6 +11,7 @@ import secrets
 import subprocess
 import sys
 from scripts.deployment import Profile, read_env, write_profile
+from scripts.gpu_topology import nvlink_pairs
 
 ROOT = Path(__file__).resolve().parent
 
@@ -28,22 +29,6 @@ def parse_gpus(text):
         result[int(idx)] = dict(index=int(idx), uuid=uuid, name=name,
                                 memory_mib=float(memory), driver=driver, mig=mig)
     return result
-
-
-def nvlink_pairs(text):
-    lines = text.splitlines()
-    header = next((line for line in lines if re.match(r"\s*GPU\d+\s+GPU\d+", line)), "")
-    labels = re.findall(r"\bGPU\d+\b", header)
-    pairs = set()
-    for line in lines:
-        cells = line.split()
-        if not cells or cells[0] not in labels:
-            continue
-        src = int(cells[0][3:])
-        for label, link in zip(labels, cells[1:]):
-            if re.fullmatch(r"NV\d+", link):
-                pairs.add(tuple(sorted((src, int(label[3:])))))
-    return sorted(pairs)
 
 
 def select_order(gpus, pairs, selected):
@@ -74,6 +59,8 @@ def main():
     parser.add_argument("--gpus", help="Three host nvidia-smi GPU indices; auto-select if exactly three GPUs exist.")
     parser.add_argument("--mode", choices=["nccl", "native", "layer"])
     parser.add_argument("--port", type=int)
+    parser.add_argument("--vision", action=argparse.BooleanOptionalAction, default=None,
+                        help="Enable image input (default); --no-vision is an explicit text-only option")
     for option in ("max-seq-len", "cache-size", "max-batch-size", "chunk-size", "draft-tokens"):
         parser.add_argument("--" + option, type=int)
     parser.add_argument("--force", action="store_true", help="Replace generated .env and config.yml, retaining existing keys/data.")
@@ -113,7 +100,7 @@ def main():
             handle.write("\n")
     previous = ROOT / "deployment.json"
     fields = json.loads(previous.read_text())["profile"] if previous.exists() else {}
-    for name in ("mode", "max_seq_len", "cache_size", "max_batch_size", "chunk_size", "draft_tokens"):
+    for name in ("mode", "max_seq_len", "cache_size", "max_batch_size", "chunk_size", "draft_tokens", "vision"):
         if getattr(args, name) is not None:
             fields[name] = getattr(args, name)
     profile = Profile(**fields).validate()

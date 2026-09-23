@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import random
+import re
 import threading
 import time
 import urllib.error
@@ -13,8 +14,10 @@ import uuid
 
 try:
     from .deployment import MODEL_NAME, read_env, validate_limits
+    from .vision_input import COLORS, image_content, solid_image
 except ImportError:
     from deployment import MODEL_NAME, read_env, validate_limits
+    from vision_input import COLORS, image_content, solid_image
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -60,7 +63,7 @@ class Client:
         return offsets[0]
 
 
-def make_prompt(client, target, max_input, corpus=None):
+def make_prompt(client, target, max_input, corpus=None, image_url=None):
     nonce = uuid.uuid4().hex
     rng = random.Random(nonce)
     # Distinct prefixes avoid cross-request KV reuse; new prompts on every trial avoid warm-cache bias.
@@ -73,7 +76,8 @@ def make_prompt(client, target, max_input, corpus=None):
               'limitations, and possible applications. Continue in detail without repeating yourself.')
 
     def messages(length):
-        return [{'role': 'user', 'content': prefix + records[:length] + suffix}]
+        text = prefix + records[:length] + suffix
+        return [{'role': 'user', 'content': image_content(text, image_url) if image_url else text}]
 
     low, high = 0, min(len(records), max(1, target * 3))
     count = client.token_count(messages(high))
@@ -197,6 +201,30 @@ def summarize(results, expected_counts, minimum_output, long_users=2, mixed=Fals
     return metrics, failures
 
 
+def vision_check(client, model, image_size=1024):
+    if model['parameters'].get('use_vision') is not True:
+        raise RuntimeError('The loaded model does not expose vision support')
+    results = []
+    # The prompt never names the expected color. An ignored image cannot reliably pass.
+    for color in random.SystemRandom().sample(list(COLORS), 2):
+        content = image_content('What color fills this image? Reply with only that color.', solid_image(color, size=image_size))
+        result = client.json('/v1/chat/completions', {'model': model['id'],
+            'messages': [{'role': 'user', 'content': content}], 'max_tokens': 128,
+            'reasoning_effort': 'low', 'reasoning_budget_tokens': 0,
+            'temperature': 0, 'top_p': 1.0})
+        answer = result['choices'][0]['message'].get('content') or ''
+        named = set(re.findall(r'\b(red|green|blue|yellow)\b', answer.lower()))
+        if named != {color}:
+            raise RuntimeError(f'Vision probe expected {color}; received {answer[:160]!r}')
+        if not result.get('usage', {}).get('prompt_tokens'):
+            raise RuntimeError('Vision response omitted prompt token accounting')
+        results.append({'expected': color, 'answer': answer, 'usage': result['usage']})
+    if client.json('/health').get('status') != 'healthy':
+        raise RuntimeError('Backend unhealthy after image requests')
+    return {'status': 'passed', 'test': 'vision', 'parameters': model['parameters'],
+            'image_dimensions': [image_size, image_size], 'results': results, 'quality_evaluation': False}
+
+
 def run_check(args, root=ROOT):
     env = read_env(root)
     url = args.url or f'http://127.0.0.1:{env.get("API_PORT", "5000")}'
@@ -211,6 +239,11 @@ def run_check(args, root=ROOT):
         raise RuntimeError('Unexpected model identity')
     params = model['parameters']
     validate_limits(params)
+    if args.mode == 'vision':
+        return vision_check(clients[0], model, args.image_size)
+    with_images = args.with_images
+    if with_images and (args.mode != 'mixed' or params.get('use_vision') is not True):
+        raise RuntimeError('--with-images requires mixed mode and loaded vision support')
     if args.mode == 'smoke':
         result = clients[0].json('/v1/chat/completions', {'model': model['id'],
             'messages': [{'role': 'user', 'content': 'Reply with READY.'}], 'max_tokens': 512,
@@ -235,7 +268,13 @@ def run_check(args, root=ROOT):
         max_input = params['max_seq_len'] - output - 2048
         if target > max_input:
             raise RuntimeError('Input plus output and checkpoint margin exceeds context')
-        messages, count = make_prompt(client, target, max_input, corpus)
+        color = list(COLORS)[i % len(COLORS)] if extra and with_images else None
+        image_url = solid_image(color, size=args.image_size) if color else None
+        messages, count = make_prompt(client, target, max_input, corpus, image_url)
+        if image_url:
+            # Same pixels and token geometry, new URL: encode must run again at
+            # timed arrival rather than hitting the cache warmed by token counting.
+            messages[0]['content'][0]['image_url']['url'] = solid_image(color, size=args.image_size)
         prompts.append(messages); counts.append(count)
         maximums.append(output); minimums.append(output if extra else minimum)
         print(f'Prepared request {i+1}: {count:,} input tokens', flush=True)
@@ -259,7 +298,8 @@ def run_check(args, root=ROOT):
                 first_events[i].set()
     report = {'status': 'failed' if errors else 'passed', 'test': args.mode, 'parameters': params,
               'model': model['id'], 'users': users, 'prepared_input_tokens': counts,
-              'chat_template_token_offset': offset,
+              'chat_template_token_offset': offset, 'extra_sessions_include_images': with_images,
+              'image_dimensions': [args.image_size, args.image_size] if with_images else None,
               'results': results, 'errors': errors, 'quality_evaluation': False}
     if not errors:
         metrics, failures = summarize(results, counts, minimums, 2 if args.mode == 'mixed' else users,
@@ -273,8 +313,11 @@ def run_check(args, root=ROOT):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['smoke', 'long', 'mixed'])
+    parser.add_argument('mode', choices=['smoke', 'vision', 'long', 'mixed'])
     parser.add_argument('--url')
+    parser.add_argument('--with-images', action='store_true',
+                        help='Mixed test: give each extra session a fresh image')
+    parser.add_argument('--image-size', type=int, default=1024, help='Square image side in pixels for vision tests')
     parser.add_argument('--reasoning-effort', choices=['low', 'high', 'max'], default='max')
     parser.add_argument('--tokens', type=int, default=260000)
     parser.add_argument('--users', type=int, choices=range(1, 9))
@@ -286,6 +329,8 @@ def main():
     parser.add_argument('--corpus', type=Path, help='Optional representative UTF-8 text/code to repeat in the prompt')
     parser.add_argument('--report', type=Path, default=ROOT / 'reports/api-check.json')
     args = parser.parse_args()
+    if not 28 <= args.image_size <= 4096:
+        parser.error('image-size must be between 28 and 4096 pixels')
     if min(args.tokens, args.max_output, args.short_tokens, args.short_output, args.timeout) < 1:
         parser.error('All limits must be positive')
     if args.min_output is not None and not 1 <= args.min_output <= args.max_output:

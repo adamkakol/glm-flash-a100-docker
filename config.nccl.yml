@@ -23,7 +23,8 @@ model:
   autosplit_reserve: [4096, 4096, 4096]
   chunk_size: 2048
   output_chunking: true
-  vision: false
+  vision: true
+  vision_offload: false
   warmup: true
   template_vars_default:
     reasoning_effort: max
@@ -41,7 +42,7 @@ sampling:
 memory:
   sysmem_recurrent_cache: 4096
   sysmem_kv_cache: 0
-  sysmem_multimodal_cache: 0
+  sysmem_multimodal_cache: 1024
 
 logging:
   log_prompt: false

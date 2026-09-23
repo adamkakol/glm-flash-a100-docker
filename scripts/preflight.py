@@ -2,6 +2,7 @@
 import os
 import subprocess
 import sys
+from gpu_topology import require_nvlink_pair
 
 
 def main():
@@ -28,12 +29,17 @@ def main():
         print("Peer access", src, [True if src == dst else torch.cuda.can_device_access_peer(src, dst) for dst in range(3)])
     if not (torch.cuda.can_device_access_peer(0, 1) and torch.cuda.can_device_access_peer(1, 0)):
         raise RuntimeError("CUDA peer access is unavailable between the selected NVLink GPUs. Check the host/VM GPU configuration.")
-    for command in [["nvidia-smi", "topo", "-m"], ["nvidia-smi", "nvlink", "--status"]]:
-        result = subprocess.run(command, text=True, capture_output=True, timeout=30)
-        print(result.stdout or result.stderr)
-        if result.returncode:
-            print("Diagnostic command failed; consult the saved host topology.")
-    print("Preflight passed. This does not yet prove model fit or long-context performance.", flush=True)
+    topology = subprocess.check_output(['nvidia-smi', 'topo', '-m'], text=True, timeout=30)
+    inventory = subprocess.check_output(['nvidia-smi', '--query-gpu=index,uuid', '--format=csv,noheader'],
+                                        text=True, timeout=30)
+    pair = require_nvlink_pair(topology, inventory, expected[:2])
+    print(topology)
+    print(f'Container topology confirms selected NVLink pair: nvidia-smi GPUs {pair}')
+    result = subprocess.run(['nvidia-smi', 'nvlink', '--status'], text=True, capture_output=True, timeout=30)
+    print(result.stdout or result.stderr)
+    if result.returncode:
+        print('NVLink status diagnostic unavailable; topology and peer access passed, traffic remains unverified.')
+    print("Preflight passed. This verifies topology and peer capability, not the transport used by inference or model performance.", flush=True)
 
 
 if __name__ == "__main__":

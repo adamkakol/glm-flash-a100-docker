@@ -7,7 +7,8 @@ by NVLink. All three participate in one shared model instance.
 The primary workload is **two concurrent sessions with approximately 260,000
 input tokens each, plus generation**. This is a performance target, not a
 limit of two clients or a fixed 260k context ceiling. Shorter sessions can use
-spare capacity, and additional requests can queue.
+spare capacity, and additional requests can queue. Text and image input are
+enabled; a helper also supports video analysis through sampled image frames.
 
 **Validation:** host-side tests pass, including real HTTP/SSE parsing against a
 mock server. The target A100 server has not been benchmarked by this project.
@@ -25,7 +26,8 @@ No model weights are included in this repository.
 | Allocator reserve per GPU | 4 GiB | Space outside planned model/cache allocations |
 | Prefill chunk | 2,048 | Starting point; tuner compares alternatives |
 | Reasoning default | `max` | Clients may override |
-| Vision | Disabled | Text serving baseline |
+| Vision | Enabled, GPU resident | Image understanding; retained during tuning |
+| Image embedding cache | 1 GiB system RAM | Reuse images across conversation turns |
 
 The scheduler starts requests when both active slots and cache pages are
 available. It may admit a smaller request while a larger one waits, with a
@@ -40,7 +42,7 @@ bounded request queue. Avoid flooding the service with queued giant prompts.
 
 A complete 260,000-token prompt plus 65,536 output tokens fits inside the
 initial window. System messages, tool definitions, chat formatting and
-reasoning all count. A single request is always capped by the configured
+reasoning and encoded image tokens all count. A single request is always capped by the configured
 context and the model's native 1,048,576-token limit.
 
 The initial shared FP16 attention cache is approximately **17.19 GiB total**
@@ -52,22 +54,54 @@ weights. Download size is not resident GPU memory.
 
 ## Why the GPU layout needs a benchmark
 
-The NVLink pair is ordered first by GPU UUID. NCCL can use its bridge and the
+The configurator reads `nvidia-smi topo -m`, requires a bidirectional `NVn`
+connection, and puts that pair first using GPU UUIDs, regardless of host indices.
+Startup rechecks the same UUID pair inside the container and requires CUDA peer
+access in both directions. NCCL can use the bridge for its reductions and the
 available PCIe/host paths to the third GPU. Do not force
 `NCCL_P2P_LEVEL=NVL`: that excludes PCIe P2P paths to the third card.
 
 The three supported allocation modes are:
 
-- `nccl`: tensor parallelism using NCCL reductions, with native fallbacks for
-  some operations.
-- `native`: ExLlama's native tensor parallel communication backend.
-- `layer`: layer splitting, which reduces cross-GPU coordination but runs less
-  work across devices simultaneously.
+- `nccl`: NCCL reductions can use NVLink. In this pinned engine, broadcast and
+  gather operations still use native host/shared-memory fallbacks.
+- `native`: CPU-assisted reductions through pinned host memory, with PCIe
+  traffic. This mode does **not** use NVLink for those reductions.
+- `layer`: layer splitting with direct device copies where the runtime probe
+  succeeds; a healthy bridged pair can use NVLink. Less work runs across devices
+  simultaneously.
 
 The pinned ExLlama allocator supports uneven channel splits across three
 cards. Some modules, including MLA attention in this version, stay whole on
 one card. A two-card NVLink bridge does not make these three GPUs a uniform
 interconnect, so topology alone cannot identify the fastest mode.
+
+Topology detection and a successful P2P/NCCL check do **not** prove which physical
+link carried inference traffic. The default profile uses NCCL, but the tuner may
+select `native` if it measures better overall performance. To exclude that mode:
+
+```bash
+python3 autotune.py --modes nccl layer
+```
+
+Even NCCL does not make every operation NVLink-only in this engine. On the server,
+inspect `nvidia-smi topo -m` and `nvidia-smi nvlink --status`, then observe actual
+NVLink data traffic while running requests:
+
+```bash
+watch -n 1 'nvidia-smi nvlink --getthroughput d'
+```
+
+The bridged cards should show Tx/Rx activity under load. If the driver does not
+expose these counters, use NVIDIA DCGM/Nsight metrics instead. NCCL `P2P/IPC` logs
+alone are insufficient: that transport can use either NVLink or PCIe. A useful
+model-free diagnostic for the selected pair (CUDA devices 0 and 1) is:
+
+```bash
+# Run while the inference server is stopped; this loads no model.
+docker compose run --rm -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT,GRAPH,P2P \
+  --entrypoint torchrun server --standalone --nproc_per_node=2 /deploy/nccl_test.py
+```
 
 ## Setup on the A100 server
 
@@ -91,6 +125,7 @@ docker compose run --rm --entrypoint python server /deploy/download_model.py --v
 
 docker compose up -d --wait --wait-timeout 1800
 python3 scripts/api_check.py smoke
+python3 scripts/api_check.py vision
 ```
 
 `configure.py --gpus 0,1,2` selects host `nvidia-smi` indices if more than three
@@ -103,11 +138,13 @@ For an existing checkout, run `git pull`, stop the service, then
 `python3 configure.py --force` and rebuild the image. Old two-slot configuration
 is replaced by the new defaults if no `deployment.json` exists. Subsequent
 `--force` runs retain recorded profile settings, selected GPU UUIDs, port and
-existing keys. Explicit options override those values. Manual `config.yml`
-edits are replaced; copy them before regeneration.
+existing keys. Profiles created before vision was recorded gain `vision=true`
+on regeneration. Explicit options override those values; use `--vision` to
+ensure it is enabled, or `--no-vision` for an intentional text-only deployment.
+Manual `config.yml` edits are replaced; copy them before regeneration.
 
 ```bash
-python3 configure.py --force --mode native --max-batch-size 4 \
+python3 configure.py --force --mode nccl --vision --max-batch-size 4 \
   --max-seq-len 524288 --cache-size 1048576 --chunk-size 2048 --draft-tokens 0
 ```
 
@@ -130,7 +167,8 @@ python3 autotune.py
 
 The default run measures **18 configurations**: three allocation modes ×
 2048/4096 prefill chunks × MTP disabled/one draft token/two draft tokens.
-Every candidate gets a smoke check and **two repetitions** of both workloads:
+Every candidate keeps the configured vision capability, gets text and image
+smoke checks when vision is enabled, and **two repetitions** of both workloads:
 
 1. Two distinct 260k prompts, each producing at least 4,096 tokens, with
    sustained overlapping output required.
@@ -138,7 +176,12 @@ Every candidate gets a smoke check and **two repetitions** of both workloads:
    long sessions begin generating**. With the default four slots, two extra
    sessions join. They must produce output while both long sessions remain
    active. The benchmark measures their TTFT and the long sessions' delivery
-   gaps, exposing interference.
+   gaps, exposing interference. With vision enabled, each extra session includes
+   a fresh 1024×1024 image. Token counting includes the image embeddings. Before
+   the timed request, a PNG metadata nonce changes the cache key without changing
+   its pixels or geometry, so actual image encoding occurs during long-session
+   decoding. Vision encoder weights, workspaces and image arrival are therefore
+   included in the memory/performance experiment.
 
 Candidates are ranked by a normalized geometric score, lower is better:
 **45% slower-user decode time per token, 25% worst long-session TTFT,
@@ -176,25 +219,72 @@ python3 autotune.py --chunks 2048 --draft-tokens 0 --repeats 1 --no-expand
 For a more representative workload, provide your own text/code body:
 
 ```bash
-python3 autotune.py --corpus /path/to/representative-code.txt
+python3 autotune.py --corpus /path/to/representative-code.txt --image-size 1536
 ```
 
 The text is repeated to reach the target lengths. New unique prefixes prevent
 cross-request prefix sharing and accidental warm-cache comparisons. Defaults
 use synthetic records. Forced-length output measures serving performance,
-not answer quality. The default benchmark uses `reasoning_effort=max`, matching
-production; `--reasoning-effort high` is available if that is your actual workload.
+not answer quality. `--image-size` changes the square probe/arrival image size
+(default 1024, range 28–4096). These checks do not establish capacity for arbitrary
+numbers of images or long videos. The default benchmark uses
+`reasoning_effort=max`, matching production; `--reasoning-effort high` is available if that is your actual workload.
 
 This selects the **best measured eligible configuration in the chosen search**,
 not a universal optimum. Re-run after changing the model, engine, driver,
 GPU placement or workload. It does not switch allocation mode during live
 requests or change precision/reasoning quality to improve its score.
 
+## Images and video
+
+Vision is enabled with `vision_offload=false`: the encoder is loaded onto GPUs
+before the text model, so the allocator accounts for it. A bounded 1 GiB host
+image-embedding cache avoids re-encoding the same image URL on every turn. The
+tuner never disables vision or offloads it to win a speed comparison. The health
+check fails if the server silently reports `use_vision=false`.
+
+The pinned API accepts text and `image_url` parts through `/v1/chat/completions`.
+Send images as `data:image/png;base64,...` (or JPEG/WebP/BMP). Remote URL fetching
+remains disabled; uploading embedded images works without it. Clients can attach
+multiple images in one message. The processor resizes images within the pinned
+checkpoint's token budget; image tokens share the context and cache with text.
+
+```bash
+python3 scripts/media_chat.py image /path/to/screenshot.png \
+  --prompt "Explain what this screenshot shows."
+```
+
+The base model also has video capability, but this TabbyAPI version has no native
+`video_url` endpoint and its exposed ExLlama embedding path handles still images.
+The helper below samples a video into timestamped images and sends them in order:
+
+```bash
+# Requires ffmpeg and ffprobe on the machine running the helper.
+python3 scripts/media_chat.py video /path/to/clip.mp4 \
+  --prompt "Summarize the visible events in chronological order." \
+  --max-frames 16 --fps 2 --max-side 1024
+```
+
+This is **frame-based video analysis, not native temporal video input**. Frames
+are distributed across the full clip, with at most the requested sampling rate
+and frame count; fast events between samples may be missed. Audio is not sent.
+Defaults limit video input to 16 frames of at most 1024 pixels per side and
+32 MiB total compressed image data. The helper checks the combined visual/text
+token count plus output against the configured context. It leaves no extracted
+frame files on disk and does not alter the source media. To test larger media
+workloads, adjust these limits deliberately and measure their interference.
+
+The checkpoint has no audio encoder or speech generation path. Audio input,
+audio output, image generation and video generation are not exposed by this
+bundle. Native video serving would require a compatible serving backend or an
+additional verified integration; turning on `vision` cannot provide it.
+
 ## Independent checks and quality
 
 ```bash
 python3 scripts/api_check.py long --tokens 260000 --users 2
-python3 scripts/api_check.py mixed --tokens 260000 --users 4
+python3 scripts/api_check.py vision
+python3 scripts/api_check.py mixed --tokens 260000 --users 4 --with-images
 # A longer generation-budget test; this forces substantial actual output:
 python3 scripts/api_check.py long --tokens 260000 --users 2 --max-output 32768
 ```
@@ -226,7 +316,7 @@ the tuner deliberately does not select more aggressive quantization.
 ## Operations and validation scope
 
 Warmup shifts initial JIT/autotuning toward model loading. The healthcheck
-checks both `/health` and the expected model/configuration. Docker health status
+checks both `/health` and the expected model/configuration, including vision. Docker health status
 alone does not restart a running process; investigate an unhealthy service and
 restart it if recovery fails. The ordinary restart policy handles process exits.
 
@@ -259,6 +349,9 @@ mock HTTP streams are not evidence of A100 throughput or model quality.
 
 - [ExLlamaV3 1.5.1: GLM-5.3 TP support](https://github.com/turboderp-org/exllamav3/releases/tag/v1.5.1)
 - [Pinned allocator](https://github.com/turboderp-org/exllamav3/blob/958ec933361b24eb8426ec7222e5b0062a679dcd/exllamav3/model/model_tp_alloc.py)
+- [Pinned communication backends](https://github.com/turboderp-org/exllamav3/blob/958ec933361b24eb8426ec7222e5b0062a679dcd/exllamav3/model/model_tp_backend.py)
+- [GLM-5.3 multimodal architecture](https://huggingface.co/docs/transformers/main/en/model_doc/glm5_next)
+- [NVIDIA NVLink diagnostics](https://docs.nvidia.com/deploy/nvidia-smi/)
 - [Pinned shared-cache scheduler](https://github.com/turboderp-org/exllamav3/blob/958ec933361b24eb8426ec7222e5b0062a679dcd/exllamav3/generator/generator.py)
 - [Pinned Tabby settings](https://github.com/theroyallab/tabbyAPI/blob/f07131cd8fe34e449fe87cdd3a066b52b96d3cac/config_sample.yml)
 - [Model guidance](https://huggingface.co/zai-org/GLM-5.3-Flash)

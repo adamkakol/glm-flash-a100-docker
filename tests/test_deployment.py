@@ -15,6 +15,7 @@ import autotune
 import configure
 from scripts.deployment import Profile, validate_limits, write_profile
 from scripts.api_check import summarize
+from scripts.gpu_topology import nvlink_pairs, require_nvlink_pair
 
 
 def record(name, ttft=100, speed=20, extra=5, pause=.5, status='passed'):
@@ -46,6 +47,16 @@ class PolicyTests(unittest.TestCase):
                     text = (root / 'config.yml').read_text()
                     self.assertIn('tensor_parallel: ' + ('false' if mode == 'layer' else 'true'), text)
                     self.assertIn('draft_mode: ' + ('mtp' if draft else 'disabled'), text)
+                    self.assertIn('vision: true', text)
+
+    def test_existing_profile_migrates_to_vision_and_explicit_opt_out_is_retained(self):
+        old_fields = asdict(Profile()); old_fields.pop('vision')
+        self.assertTrue(Profile(**old_fields).vision)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); (root / 'config.nccl.yml').write_text((ROOT / 'config.nccl.yml').read_text())
+            value = write_profile(root, replace(Profile(), vision=False))
+            self.assertFalse(Profile(**value['profile']).vision)
+            self.assertIn('vision: false', (root / 'config.yml').read_text())
 
     def test_force_retains_port_keys_and_gpu_selection(self):
         inventory = '\n'.join(f'{i}, GPU-{i:08x}-aaaa, A100 80GB, 81920, 580.95.05, Disabled' for i in range(4))
@@ -62,6 +73,37 @@ class PolicyTests(unittest.TestCase):
             self.assertIn('API_PORT=5005', (root / '.env').read_text())
             self.assertIn('GPU1_UUID=GPU-00000002-aaaa', (root / '.env').read_text())
             self.assertEqual((root / 'secrets/api_tokens.yml').stat().st_mode & 0o777, 0o600)
+
+
+class TopologyTests(unittest.TestCase):
+    def topology(self, indices, pair):
+        text = ' '.join(f'GPU{i}' for i in indices) + ' NIC0 CPU Affinity NUMA Affinity\n'
+        for i in indices:
+            cells = ['X' if i == j else 'NV12' if {i, j} == set(pair) else 'PHB' for j in indices]
+            text += f'GPU{i} ' + ' '.join(cells) + ' PIX 0-15 0\n'
+        return text
+
+    def test_all_pair_positions_and_noncontiguous_indices(self):
+        for indices in [(0, 1, 2), (2, 5, 8)]:
+            for pair in [(indices[0], indices[1]), (indices[0], indices[2]), (indices[1], indices[2])]:
+                topo = self.topology(indices, pair)
+                with self.subTest(indices=indices, pair=pair):
+                    self.assertEqual(nvlink_pairs(topo), [pair])
+                    inventory = '\n'.join(f'{i}, GPU-uuid-{i}' for i in reversed(indices))
+                    selected = [f'GPU-uuid-{i}' for i in reversed(pair)]
+                    self.assertEqual(require_nvlink_pair(topo, inventory, selected), pair)
+
+    def test_missing_asymmetric_and_zero_links_are_rejected(self):
+        text = self.topology((0, 1, 2), (0, 1))
+        for broken in [text.replace('NV12', 'PHB'), text.replace('NV12', 'NV0'), text.replace('NV12', 'PHB', 1)]:
+            self.assertEqual(nvlink_pairs(broken), [])
+            with self.assertRaisesRegex(RuntimeError, 'NVLink connection'):
+                require_nvlink_pair(broken, '0, GPU-a\n1, GPU-b\n2, GPU-c', ['GPU-a', 'GPU-b'])
+
+    def test_inventory_mapping_prevents_accepting_the_wrong_pair(self):
+        with self.assertRaisesRegex(RuntimeError, 'NVLink connection'):
+            require_nvlink_pair(self.topology((0, 1, 2), (0, 1)),
+                                '0, GPU-a\n1, GPU-b\n2, GPU-c', ['GPU-a', 'GPU-c'])
 
 
 class RankingTests(unittest.TestCase):

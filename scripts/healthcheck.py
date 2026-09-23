@@ -24,6 +24,8 @@ def main():
     if model["id"] != expected["model_name"]:
         raise RuntimeError("Unexpected loaded model")
     params = model["parameters"]
+    if params.get("use_vision") is not expected["vision"]:
+        raise RuntimeError("Loaded vision capability differs from config.yml")
     for name in ("max_seq_len", "cache_size", "max_batch_size", "chunk_size", "cache_mode"):
         if params.get(name) != expected[name]:
             raise RuntimeError(f"Loaded {name} differs from config.yml")

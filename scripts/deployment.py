@@ -22,6 +22,7 @@ class Profile:
     cache_size: int = 1048576
     max_batch_size: int = 4
     reserve_mib: int = 4096
+    vision: bool = True
 
     def validate(self):
         if self.mode not in {"nccl", "native", "layer"}:
@@ -30,6 +31,8 @@ class Profile:
             raise ValueError("chunk_size must be 1024, 2048 or 4096")
         if self.draft_tokens not in {0, 1, 2}:
             raise ValueError("draft_tokens must be 0, 1 or 2")
+        if type(self.vision) is not bool:
+            raise ValueError("vision must be a boolean")
         validate_limits(asdict(self))
         if not 3072 <= self.reserve_mib <= 16384:
             raise ValueError("Keep 3072–16384 MiB of allocator reserve per GPU")
@@ -38,7 +41,7 @@ class Profile:
     @property
     def name(self):
         return (f"{self.mode}-c{self.chunk_size}-mtp{self.draft_tokens}"
-                f"-ctx{self.max_seq_len}-cache{self.cache_size}-b{self.max_batch_size}")
+                f"-ctx{self.max_seq_len}-cache{self.cache_size}-b{self.max_batch_size}-vision{int(self.vision)}")
 
 
 def validate_limits(model):
@@ -64,6 +67,7 @@ def render_config(template, profile):
         "autosplit_reserve": json.dumps([profile.reserve_mib] * 3),
         "draft_mode": "mtp" if profile.draft_tokens else "disabled",
         "draft_num_tokens": max(1, profile.draft_tokens),
+        "vision": str(profile.vision).lower(),
     }
     for key, value in replacements.items():
         template, count = re.subn(rf"(?m)^(  {key}:).*$", rf"\g<1> {value}", template)

@@ -1,0 +1,7 @@
+data/
+reports/
+secrets/
+.env
+config.yml
+__pycache__/
+*.zip

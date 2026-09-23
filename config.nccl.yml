@@ -1,0 +1,44 @@
+network:
+  host: 0.0.0.0
+  port: 5000
+  disable_auth: false
+  allowed_origins: []
+  disable_fetch_requests: true
+  api_servers: [oai]
+  sse_ping_interval: 15
+
+model:
+  model_dir: /models
+  model_name: GLM-5.3-Flash-exl3-4.05bpw
+  backend: exllamav3
+  inline_model_loading: false
+  max_seq_len: 327680
+  cache_size: 655360
+  max_batch_size: 2
+  cache_mode: FP16
+  tensor_parallel: true
+  tensor_parallel_backend: nccl
+  gpu_split_auto: true
+  # MiB reserved on each logical GPU, separate from model/cache allocation.
+  autosplit_reserve: [4096, 4096, 4096]
+  chunk_size: 2048
+  output_chunking: true
+  vision: false
+  warmup: false
+  template_vars_default:
+    reasoning_effort: max
+  reasoning: true
+
+draft_model:
+  draft_mode: disabled
+
+memory:
+  sysmem_recurrent_cache: 4096
+  sysmem_kv_cache: 0
+  sysmem_multimodal_cache: 0
+
+logging:
+  log_prompt: false
+  log_generation_params: false
+  log_requests: false
+  log_chat_completion_requests: false

@@ -1,0 +1,149 @@
+[
+  {
+    "path": ".gitattributes",
+    "size": 1696
+  },
+  {
+    "path": "LICENSE",
+    "size": 1070
+  },
+  {
+    "path": "README.md",
+    "size": 7238
+  },
+  {
+    "path": "chat_template.jinja",
+    "size": 8617
+  },
+  {
+    "path": "config.json",
+    "size": 86509
+  },
+  {
+    "path": "generation_config.json",
+    "size": 194
+  },
+  {
+    "path": "model-00001-of-00019.safetensors",
+    "size": 8587818716,
+    "sha256": "1c7a87b0fb108521d0cf3e495ca63c37732a06744131e8933ca12d2df0d8806e"
+  },
+  {
+    "path": "model-00002-of-00019.safetensors",
+    "size": 8587936824,
+    "sha256": "a67cd8e559ac013fc0d1dc58b66bd105e54bee0a31147b295089b2537646d4dc"
+  },
+  {
+    "path": "model-00003-of-00019.safetensors",
+    "size": 8590375904,
+    "sha256": "d069cea25c6082a70b2dbc601725687f8d164a5dd047894acb58476b4175c1af"
+  },
+  {
+    "path": "model-00004-of-00019.safetensors",
+    "size": 8590340084,
+    "sha256": "d222d3137bec069a165219542d49d02defef2df69763464e93463a176e2ba935"
+  },
+  {
+    "path": "model-00005-of-00019.safetensors",
+    "size": 8590383216,
+    "sha256": "6fdd4557f29e1b77248b6bbd6b35c691ef4b1dc63b7305c9f5cb0080e1c82836"
+  },
+  {
+    "path": "model-00006-of-00019.safetensors",
+    "size": 8587986708,
+    "sha256": "3e9c1f39a631dedd5cce7614947d1f3eab71c93dbb4c79bd2eec0ab413236055"
+  },
+  {
+    "path": "model-00007-of-00019.safetensors",
+    "size": 8590342372,
+    "sha256": "62eca4decce10159107948a320083d8e9dcf60f25e058877a1662b80f1412220"
+  },
+  {
+    "path": "model-00008-of-00019.safetensors",
+    "size": 8590383800,
+    "sha256": "e8f8762fa1c6a698fc74d50760b82ec72d6043fb9ef6e05dac4032999f57d7c5"
+  },
+  {
+    "path": "model-00009-of-00019.safetensors",
+    "size": 8587944528,
+    "sha256": "f9d2e2df7fc7a65c33514a584e5a228d5eb4bec72fc516d9c649c94b06e3d00e"
+  },
+  {
+    "path": "model-00010-of-00019.safetensors",
+    "size": 8590383896,
+    "sha256": "5eb19bda8461e44323898172492f9f5c948f5c8ad00816b0e004feaf8b11ccfa"
+  },
+  {
+    "path": "model-00011-of-00019.safetensors",
+    "size": 8590342356,
+    "sha256": "f2e687a3d410af6bd48f90d5770fac1054ad5c337d3cfa2bd56a5600387ba36a"
+  },
+  {
+    "path": "model-00012-of-00019.safetensors",
+    "size": 8590383392,
+    "sha256": "caee2cdd11e781195a3bbb70b53da0c08c4add3485e200a4a28119d238201523"
+  },
+  {
+    "path": "model-00013-of-00019.safetensors",
+    "size": 8587986540,
+    "sha256": "094d5b9341505d25852993e0eef6d137ba75c4179bec2204bd067af264da5dd1"
+  },
+  {
+    "path": "model-00014-of-00019.safetensors",
+    "size": 8590342372,
+    "sha256": "765f21794314da81bccdf6a1c9b3fff3f86711d34d83f7551667455a9775dc1a"
+  },
+  {
+    "path": "model-00015-of-00019.safetensors",
+    "size": 8590383888,
+    "sha256": "f08d208c8ad27b3bb9c75c42c90e33a3e8acd722ccf5f4f74df1638084d46067"
+  },
+  {
+    "path": "model-00016-of-00019.safetensors",
+    "size": 8590341500,
+    "sha256": "e4c0bbf93639fd96eddb9a38505c4de99d650f82d376c0e303a7c3fd38544c3d"
+  },
+  {
+    "path": "model-00017-of-00019.safetensors",
+    "size": 8587986956,
+    "sha256": "8e954f3e1660889a50974f46e66ad75a4e3bcadb0398a91646d58a09d9c2f54c"
+  },
+  {
+    "path": "model-00018-of-00019.safetensors",
+    "size": 8590342372,
+    "sha256": "bad6f1e51e7bd25a4da4fe55efe4f91512bf4e82085db2baa5cce1adea027c58"
+  },
+  {
+    "path": "model-00019-of-00019.safetensors",
+    "size": 6661824340,
+    "sha256": "de2031315b49f89e3d091e92bead8b239ea46e304236f34b5734a68b0b07d547"
+  },
+  {
+    "path": "model.safetensors.index.json",
+    "size": 15963650,
+    "sha256": "ee1f2dbea800dea0b4225c38193f7ef41180ed42dd51f80a0cee58daf44cf606"
+  },
+  {
+    "path": "mtp.safetensors",
+    "size": 3793519833,
+    "sha256": "1bd09bd4eff4adc568e4ac3e92efb436c2d3aa5f0dceab4c72005d796066822d"
+  },
+  {
+    "path": "processor_config.json",
+    "size": 909
+  },
+  {
+    "path": "quantization_config.json",
+    "size": 47905678,
+    "sha256": "d18c35bf6184a67a3b612b15c216bdfdf9e81505c0e02b646152925b13fafef3"
+  },
+  {
+    "path": "tokenizer.json",
+    "size": 20217442,
+    "sha256": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d"
+  },
+  {
+    "path": "tokenizer_config.json",
+    "size": 761
+  }
+]

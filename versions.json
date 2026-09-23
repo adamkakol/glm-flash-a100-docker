@@ -1,0 +1,21 @@
+{
+  "prepared": "2026-09-23",
+  "base_image": "nvidia/cuda:12.8.1-runtime-ubuntu24.04@sha256:ebef3c171eeef0298e4eb2e4be843105edf3b8b0ac45e0b43acee358e8046867",
+  "tabbyapi": {
+    "commit": "f07131cd8fe34e449fe87cdd3a066b52b96d3cac",
+    "archive_sha256": "78452c8a412cfe8ba19294a73bc0d2358a8cc85e6c79e6bddee74938daa3e4cb"
+  },
+  "exllamav3": {
+    "version": "1.5.1",
+    "commit": "958ec933361b24eb8426ec7222e5b0062a679dcd",
+    "wheel": "exllamav3-1.5.1+cu128.torch2.9.0-cp312-cp312-linux_x86_64.whl",
+    "sha256": "af324869c4863aeb727443e2e0c8a44c20e916ecceb1b4043dbd58903c0d0ed0"
+  },
+  "torch": "2.9.0+cu128",
+  "model": {
+    "repo_id": "turboderp/GLM-5.3-Flash-exl3",
+    "branch_label": "4.05bpw",
+    "revision": "2a30229e67012798ba9f0cd832bb78abf4c363d5",
+    "directory": "GLM-5.3-Flash-exl3-4.05bpw"
+  }
+}

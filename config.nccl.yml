@@ -12,9 +12,9 @@ model:
   model_name: GLM-5.3-Flash-exl3-4.05bpw
   backend: exllamav3
   inline_model_loading: false
-  max_seq_len: 327680
-  cache_size: 655360
-  max_batch_size: 2
+  max_seq_len: 524288
+  cache_size: 1048576
+  max_batch_size: 4
   cache_mode: FP16
   tensor_parallel: true
   tensor_parallel_backend: nccl
@@ -24,13 +24,19 @@ model:
   chunk_size: 2048
   output_chunking: true
   vision: false
-  warmup: false
+  warmup: true
   template_vars_default:
     reasoning_effort: max
+    clear_thinking: true
   reasoning: true
 
 draft_model:
   draft_mode: disabled
+  draft_num_tokens: 1
+  dynamic_draft: false
+
+sampling:
+  override_preset: glm
 
 memory:
   sysmem_recurrent_cache: 4096

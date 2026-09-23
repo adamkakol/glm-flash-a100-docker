@@ -1,0 +1,16 @@
+# Fallbacks only; explicit client settings take precedence.
+temperature:
+  override: 1.0
+  force: false
+top_p:
+  override: 0.95
+  force: false
+top_k:
+  override: 0
+  force: false
+min_p:
+  override: 0.0
+  force: false
+repetition_penalty:
+  override: 1.0
+  force: false

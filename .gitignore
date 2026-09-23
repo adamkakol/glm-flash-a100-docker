@@ -5,3 +5,5 @@ secrets/
 config.yml
 __pycache__/
 *.zip
+deployment.json
+.autotune.lock

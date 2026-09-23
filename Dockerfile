@@ -31,6 +31,7 @@ RUN curl --fail --location --retry 3 \
 
 COPY scripts/ /deploy/
 COPY versions.json model-manifest.json /deploy/
+COPY sampling/glm.yml /app/sampler_overrides/glm.yml
 RUN python /deploy/install_requirements.py \
     && pip install --no-cache-dir -r /tmp/requirements.in \
     && pip check \

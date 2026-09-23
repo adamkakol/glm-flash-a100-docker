@@ -10,6 +10,7 @@ import re
 import secrets
 import subprocess
 import sys
+from scripts.deployment import Profile, read_env, write_profile
 
 ROOT = Path(__file__).resolve().parent
 
@@ -71,17 +72,30 @@ def select_order(gpus, pairs, selected):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpus", help="Three host nvidia-smi GPU indices; auto-select if exactly three GPUs exist.")
-    parser.add_argument("--mode", choices=["nccl", "native", "layer"], default="nccl")
-    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--mode", choices=["nccl", "native", "layer"])
+    parser.add_argument("--port", type=int)
+    for option in ("max-seq-len", "cache-size", "max-batch-size", "chunk-size", "draft-tokens"):
+        parser.add_argument("--" + option, type=int)
     parser.add_argument("--force", action="store_true", help="Replace generated .env and config.yml, retaining existing keys/data.")
     args = parser.parse_args()
-    if not 1024 <= args.port <= 65535:
+    previous_env = read_env(ROOT)
+    port = args.port if args.port is not None else int(previous_env.get("API_PORT", "5000"))
+    if not 1024 <= port <= 65535:
         parser.error("Choose a port from 1024 to 65535.")
     if not args.force and any((ROOT / p).exists() for p in [".env", "config.yml"]):
         parser.error("Existing configuration found; use --force to replace it (keys and model data are retained).")
     gpus = parse_gpus(command("nvidia-smi", "--query-gpu=index,uuid,name,memory.total,driver_version,mig.mode.current", "--format=csv,noheader,nounits"))
     topo = command("nvidia-smi", "topo", "-m")
-    selected = [int(x) for x in args.gpus.split(",")] if args.gpus else list(gpus)
+    if args.gpus:
+        selected = [int(x) for x in args.gpus.split(",")]
+    elif all(f"GPU{i}_UUID" in previous_env for i in range(3)):
+        by_uuid = {gpu["uuid"]: idx for idx, gpu in gpus.items()}
+        try:
+            selected = [by_uuid[previous_env[f"GPU{i}_UUID"]] for i in range(3)]
+        except KeyError:
+            raise ValueError("A previously selected GPU is missing; select GPUs explicitly with --gpus")
+    else:
+        selected = list(gpus)
     order = select_order(gpus, nvlink_pairs(topo), selected)
     print(topo)
     for logical, physical in enumerate(order):
@@ -97,18 +111,19 @@ def main():
             json.dump({"api_key": [secrets.token_urlsafe(32), secrets.token_urlsafe(32)],
                        "admin_key": secrets.token_urlsafe(48)}, handle, indent=2)
             handle.write("\n")
-    config = (ROOT / "config.nccl.yml").read_text()
-    if args.mode == "native":
-        config = config.replace("tensor_parallel_backend: nccl", "tensor_parallel_backend: native")
-    elif args.mode == "layer":
-        config = config.replace("tensor_parallel: true", "tensor_parallel: false")
-    (ROOT / "config.yml").write_text(config)
+    previous = ROOT / "deployment.json"
+    fields = json.loads(previous.read_text())["profile"] if previous.exists() else {}
+    for name in ("mode", "max_seq_len", "cache_size", "max_batch_size", "chunk_size", "draft_tokens"):
+        if getattr(args, name) is not None:
+            fields[name] = getattr(args, name)
+    profile = Profile(**fields).validate()
+    write_profile(ROOT, profile)
     env = [f"GPU{i}_UUID={gpus[idx]['uuid']}" for i, idx in enumerate(order)]
-    env += [f"LOCAL_UID={os.getuid()}", f"LOCAL_GID={os.getgid()}", f"API_PORT={args.port}"]
+    env += [f"LOCAL_UID={os.getuid()}", f"LOCAL_GID={os.getgid()}", f"API_PORT={port}"]
     (ROOT / ".env").write_text("\n".join(env) + "\n")
     (ROOT / "reports/host-topology.txt").write_text(topo)
     (ROOT / "reports/gpu-selection.json").write_text(json.dumps([gpus[i] for i in order], indent=2))
-    print(f"Configured mode={args.mode}, localhost port={args.port}. Keys: secrets/api_tokens.yml (not printed).")
+    print(f"Configured {profile.name}, localhost port={port}. Keys: secrets/api_tokens.yml (not printed).")
     print("Next: docker compose build")
 
 

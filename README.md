@@ -1,85 +1,80 @@
 # GLM-5.3-Flash on three A100 80GB GPUs
 
-Docker deployment for `turboderp/GLM-5.3-Flash-exl3`, **4.05bpw**, using
-**ExLlamaV3 1.5.1 + TabbyAPI + PyTorch 2.9.0 / CUDA 12.8**. Prepared 2026-09-23.
+Deploy `turboderp/GLM-5.3-Flash-exl3` **4.05bpw** with pinned **ExLlamaV3 1.5.1,
+TabbyAPI, and PyTorch 2.9.0 / CUDA 12.8**. Two of the three cards are connected
+by NVLink. All three participate in one shared model instance.
 
-This bundle targets **three full A100 80GB GPUs**, with two connected by NVLink.
-It is not sized for three 40GB A100s. GPU memory, MIG mode, bridge topology,
-CUDA visibility and peer access are checked before loading the model.
+The primary workload is **two concurrent sessions with approximately 260,000
+input tokens each, plus generation**. This is a performance target, not a
+limit of two clients or a fixed 260k context ceiling. Shorter sessions can use
+spare capacity, and additional requests can queue.
 
-**Validation status:** configuration and scripts have been checked against the
-pinned upstream source. This environment has no Docker daemon or NVIDIA GPU,
-so the image build, model fit, GPU kernels and two simultaneous 250k-token
-requests still need to pass the included checks on your server. These are
-deployment settings, not a measured performance or capacity guarantee.
+**Validation:** host-side tests pass, including real HTTP/SSE parsing against a
+mock server. The target A100 server has not been benchmarked by this project.
+The autotuner must run there to establish fit and select a measured configuration.
+No model weights are included in this repository.
 
-## How the bridge is used
+## Resource limits
 
-One model instance spans all three GPUs. The default enables ExLlama's tensor
-parallel mode with the NCCL communication backend. NCCL can use the NVLink
-connection between the paired cards and PCIe or host transport to the third
-card, according to the actual topology and peer access support.
+| Setting | Initial value | Purpose |
+|---|---:|---|
+| Per-request context, input plus output | 524,288 | Allows requests beyond the 260k target |
+| Shared token cache | 1,048,576 | Pooled across requests; not reserved in full per user |
+| Maximum active generation jobs | 4 | Allows a third and fourth request when cache permits |
+| Cache precision | FP16 | Preserve quality initially |
+| Allocator reserve per GPU | 4 GiB | Space outside planned model/cache allocations |
+| Prefill chunk | 2,048 | Starting point; tuner compares alternatives |
+| Reasoning default | `max` | Clients may override |
+| Vision | Disabled | Text serving baseline |
 
-ExLlamaV3 1.5.1 specifically added tensor parallel support for GLM-5.3.
-Its allocator supports uneven splits; it does not require all head counts to
-divide evenly by three. Some components, including MLA attention blocks in
-this version, stay whole on one GPU while other components are split.
+The scheduler starts requests when both active slots and cache pages are
+available. It may admit a smaller request while a larger one waits, with a
+skip limit for approximate fairness. **Four slots do not promise four full
+512k windows at once.** There is no per-user reservation: a user can submit
+more than one request. The default two API keys do not limit client count.
 
-The third card can limit synchronization speed. This is **not** a special
-“TP=2 plus one extra memory GPU” arrangement, and the bridge does not combine
-two cards into one CUDA device. All three participate in inference. The full
-checkpoint is about **165.15 GB / 153.81 GiB on disk**; keeping it on the pair
-alone would leave inadequate planning headroom for two long contexts and the
-runtime. Actual loaded VRAM differs from file size.
+The cache and batch limits bound planned GPU allocations. They do not bound
+HTTP queue length or guarantee latency under unlimited submitted work. Use
+trusted clients and, for broader exposure, an authenticated proxy with a
+bounded request queue. Avoid flooding the service with queued giant prompts.
 
-The configuration intentionally leaves `NCCL_P2P_LEVEL`, `NCCL_P2P_DISABLE`,
-`NCCL_ALGO` and `NCCL_TOPO_FILE` unset. In particular, forcing
-`NCCL_P2P_LEVEL=NVL` would exclude the third card's PCIe P2P paths.
-NCCL handles reductions; ExLlama also uses its native backend for some other
-communication operations. A bridge alone does not guarantee a speedup.
+A complete 260,000-token prompt plus 65,536 output tokens fits inside the
+initial window. System messages, tool definitions, chat formatting and
+reasoning all count. A single request is always capped by the configured
+context and the model's native 1,048,576-token limit.
 
-## Settings
+The initial shared FP16 attention cache is approximately **17.19 GiB total**
+for this model's 11 sparse MLA layers; its 34 linear-attention layers use
+recurrent state. This is a source-derived estimate, excluding weights,
+temporary buffers, recurrent history, CUDA graphs and placement imbalance.
+The complete download is approximately 165.15 GB / 153.81 GiB, including MTP
+weights. Download size is not resident GPU memory.
 
-| Setting | Value |
-|---|---|
-| Quantization | EXL3 4.05 bits/weight checkpoint |
-| Model instances | 1, shared by both users |
-| Context per request, input plus output | 327,680 tokens |
-| Shared token cache | 655,360 tokens |
-| Maximum active generation jobs | 2 |
-| Cache mode | FP16; no additional cache quantization |
-| Prefill chunk | 2,048 tokens |
-| VRAM reserved outside model allocation | 4 GiB per card |
-| Reasoning effort default | max; clients can override |
-| Vision / speculative decoding | Disabled |
-| API | OpenAI-compatible, `http://127.0.0.1:5000/v1` |
+## Why the GPU layout needs a benchmark
 
-250,000 input tokens leave 77,680 tokens for chat formatting and output within
-the configured window. Thinking tokens also consume output/context space.
-The cache budget is shared across jobs: setting only `max_seq_len` would not
-provide capacity for two complete windows. More clients can queue; this is
-not an HTTP admission limit of two connections.
+The NVLink pair is ordered first by GPU UUID. NCCL can use its bridge and the
+available PCIe/host paths to the third GPU. Do not force
+`NCCL_P2P_LEVEL=NVL`: that excludes PCIe P2P paths to the third card.
 
-## Host prerequisites
+The three supported allocation modes are:
 
-- Linux x86-64, Docker Engine and the Docker Compose v2 plugin.
-- NVIDIA Container Toolkit configured for Docker, and driver **570.124.06 or
-  newer**. This bundle uses that conservative driver floor for CUDA 12.8.1 and
-  Triton JIT; it does not rely on older-driver minor-version compatibility.
-- Three A100 80GB GPUs available exclusively to this service, MIG disabled.
-- Approximately **250 GB free SSD space** for weights, image and caches;
-  **128 GB system RAM recommended** as a planning allowance, not a measured
-  minimum. Model weights remain on GPUs during serving.
-- Python 3.10+ on the host for the configuration and API check scripts.
+- `nccl`: tensor parallelism using NCCL reductions, with native fallbacks for
+  some operations.
+- `native`: ExLlama's native tensor parallel communication backend.
+- `layer`: layer splitting, which reduces cross-GPU coordination but runs less
+  work across devices simultaneously.
 
-Follow NVIDIA's [Container Toolkit installation guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-if GPU access from Docker is not already configured. Do not install the GPU
-driver inside this image. Configuring Docker or updating drivers is a host
-administration task; this bundle does not change them automatically.
+The pinned ExLlama allocator supports uneven channel splits across three
+cards. Some modules, including MLA attention in this version, stay whole on
+one card. A two-card NVLink bridge does not make these three GPUs a uniform
+interconnect, so topology alone cannot identify the fastest mode.
 
-## Build and start
+## Setup on the A100 server
 
-Clone the repository and run these commands as your normal Docker user.
+Requirements: Linux x86-64, three exclusive A100 **80GB** GPUs with MIG disabled,
+NVIDIA driver >=570.124.06, NVIDIA Container Toolkit, Docker Engine and Compose
+v2, and host Python 3.10+. Plan for roughly 250 GB free SSD storage and 128 GB
+system RAM; these are allowances, not measured minima.
 
 ```bash
 git clone https://github.com/adamkakol/glm-flash-a100-docker.git
@@ -87,145 +82,192 @@ cd glm-flash-a100-docker
 python3 configure.py
 docker compose build
 
-# Small GPU checks before downloading the 165 GB checkpoint:
+# Checks before downloading weights:
 docker compose run --rm --entrypoint python server /deploy/preflight.py
-docker compose run --rm -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT,GRAPH,P2P --entrypoint torchrun server --standalone --nproc_per_node=3 /deploy/nccl_test.py
+docker compose run --rm -e NCCL_DEBUG=INFO --entrypoint torchrun server --standalone --nproc_per_node=3 /deploy/nccl_test.py
 
-# Download the immutable revision; rerunning resumes an interrupted download.
+# The ONLY model download step; run it on the A100 server:
 docker compose run --rm --entrypoint python server /deploy/download_model.py --verify-hashes
 
-docker compose up -d
-docker compose logs -f server
-```
-
-`configure.py` detects the NVLink pair and orders the GPUs by UUID. If the host
-has more than three GPUs, select the intended ones with
-`python3 configure.py --gpus 0,1,2` using **host `nvidia-smi` indices**. The pair
-does not have to be GPU 0 and GPU 1. It creates local directories, `.env`,
-`config.yml`, two user API keys and a separate admin key. It keeps existing keys
-on subsequent runs. No real credentials or weights are shipped in this bundle.
-
-The Docker build follows the pinned upstream CUDA-12 dependency set. The CUDA
-base digest, Tabby source archive and ExLlama wheel are checked/pinned, and the
-model is pinned by its complete Hugging Face commit hash. Supporting Python
-and Ubuntu packages are resolved at build time; this is not a fully frozen
-transitive dependency lock. The resolved Python packages are recorded inside
-the image at `/opt/runtime-requirements.txt`. Retain your built image for exact
-runtime reuse.
-
-First load and Triton compilation can take several minutes. The 30-minute
-healthcheck start period accommodates slow initialization; it is not a promise
-of load time. Startup runs preflight again and checks all model file sizes and
-the revision marker. It never silently downloads a different model.
-
-## Verify the model and two long requests
-
-After the service is healthy:
-
-```bash
-docker compose ps
+docker compose up -d --wait --wait-timeout 1800
 python3 scripts/api_check.py smoke
-python3 scripts/api_check.py long --tokens 250000 --users 2
 ```
 
-The long check builds two different synthetic prompts, tokenizes them through
-the server, and sends both requests concurrently. It checks the **reported
-input token counts** and records time to first token, throughput when reported,
-completion status and generation interval overlap in `reports/api-check.json`.
-It can take a long time on A100s. Run it before relying on this service for
-two simultaneous large documents.
+`configure.py --gpus 0,1,2` selects host `nvidia-smi` indices if more than three
+GPUs exist. The NVLink pair may use any two indices. Configuration creates
+`.env`, `config.yml`, `deployment.json`, two user keys and a separate admin key.
+Use the user keys from `secrets/api_tokens.yml`, model
+`GLM-5.3-Flash-exl3-4.05bpw`, and `http://127.0.0.1:5000/v1`.
 
-Watch memory and GPU utilization in another terminal:
+For an existing checkout, run `git pull`, stop the service, then
+`python3 configure.py --force` and rebuild the image. Old two-slot configuration
+is replaced by the new defaults if no `deployment.json` exists. Subsequent
+`--force` runs retain recorded profile settings, selected GPU UUIDs, port and
+existing keys. Explicit options override those values. Manual `config.yml`
+edits are replaced; copy them before regeneration.
 
 ```bash
-nvidia-smi --query-gpu=index,uuid,memory.used,memory.total,utilization.gpu --format=csv -l 1
+python3 configure.py --force --mode native --max-batch-size 4 \
+  --max-seq-len 524288 --cache-size 1048576 --chunk-size 2048 --draft-tokens 0
 ```
 
-Acceptance means the image builds, preflight and the three-GPU NCCL test pass,
-the correct model becomes healthy, and both >=250k input requests complete
-without GPU errors or input truncation. Check generation overlap and latency
-against your users' requirements. Overlapping HTTP requests alone do not prove
-concurrent decoding. The synthetic check establishes capacity and basic
-execution; evaluate representative reasoning, coding and retrieval tasks
-separately to judge quality at 250k.
+Configuration guards allow 3–8 active slots and require enough shared cache
+for two target windows (655,360 tokens total), without requiring
+`cache_size >= max_batch_size * max_seq_len`. Manual increases still require
+hardware testing. Never run diagnostics or tuning alongside another GPU workload.
 
-## Client access
+## Select an efficient configuration automatically
 
-Use the user keys in `secrets/api_tokens.yml`, with model name
-`GLM-5.3-Flash-exl3-4.05bpw` and a normal bearer `Authorization` header.
-The keys file is JSON syntax, which is also valid YAML; preserve that syntax
-when editing so the dependency-free host test client can read it.
-The admin key permits model management; give users the user keys.
+After the image and pinned model have been installed on the A100 server:
 
-The default host binding is localhost. For a remote workstation:
+```bash
+# Inspection only: does not start containers or load/download anything.
+python3 autotune.py --plan
+
+# Maintenance operation: disconnect clients first.
+python3 autotune.py
+```
+
+The default run measures **18 configurations**: three allocation modes ×
+2048/4096 prefill chunks × MTP disabled/one draft token/two draft tokens.
+Every candidate gets a smoke check and **two repetitions** of both workloads:
+
+1. Two distinct 260k prompts, each producing at least 4,096 tokens, with
+   sustained overlapping output required.
+2. The same two long sessions, followed by extra short requests **after both
+   long sessions begin generating**. With the default four slots, two extra
+   sessions join. They must produce output while both long sessions remain
+   active. The benchmark measures their TTFT and the long sessions' delivery
+   gaps, exposing interference.
+
+Candidates are ranked by a normalized geometric score, lower is better:
+**45% slower-user decode time per token, 25% worst long-session TTFT,
+20% extra-user TTFT, and 10% worst long-session delivery pause in the mixed
+test.** Repeated trials use median metrics. Capacity is only eligibility;
+a configuration that merely loads cannot win. Failed inference, truncated
+input, short output, absent overlap, failed health or less than **3 GiB sampled
+free VRAM on any selected GPU** excludes a candidate. Sampling every 0.5 seconds
+is an observation, not a guarantee against sub-sample memory spikes.
+
+The best candidate must also pass a single request near its advertised context
+ceiling. If it fails, the tuner tries the next ranked candidate. It then tests
+an optional expansion to **1,048,576 context / 1,572,864 shared cache**. Expansion
+is retained only if it passes the same workload and boundary checks, preserves
+headroom, and none of the four scored costs regresses by more than 5%.
+Use `--no-expand` to skip this additional experiment. Larger cache alone is
+not considered an optimization.
+
+The selected profile is saved and started automatically. Reports, per-stream
+timestamps, actual token counts, memory peaks, mode, package pins, image ID,
+hardware/driver information and the original configuration go under
+`reports/autotune-*/`. A failed or interrupted run restores the previous config
+and whether the service was running. SIGKILL, power loss and machine crashes
+cannot execute that rollback; use `original-config.yml` and
+`original-deployment.json` from the report directory for manual recovery.
+No model or image is downloaded by the tuner; it uses `--no-build --pull never`.
+
+**This can take many hours**, especially the near-1M boundary run. An initial,
+narrower comparison is available; its winner is only the best of those candidates:
+
+```bash
+python3 autotune.py --chunks 2048 --draft-tokens 0 --repeats 1 --no-expand
+```
+
+For a more representative workload, provide your own text/code body:
+
+```bash
+python3 autotune.py --corpus /path/to/representative-code.txt
+```
+
+The text is repeated to reach the target lengths. New unique prefixes prevent
+cross-request prefix sharing and accidental warm-cache comparisons. Defaults
+use synthetic records. Forced-length output measures serving performance,
+not answer quality. The default benchmark uses `reasoning_effort=max`, matching
+production; `--reasoning-effort high` is available if that is your actual workload.
+
+This selects the **best measured eligible configuration in the chosen search**,
+not a universal optimum. Re-run after changing the model, engine, driver,
+GPU placement or workload. It does not switch allocation mode during live
+requests or change precision/reasoning quality to improve its score.
+
+## Independent checks and quality
+
+```bash
+python3 scripts/api_check.py long --tokens 260000 --users 2
+python3 scripts/api_check.py mixed --tokens 260000 --users 4
+# A longer generation-budget test; this forces substantial actual output:
+python3 scripts/api_check.py long --tokens 260000 --users 2 --max-output 32768
+```
+
+Before constructing long prompts, the checker calibrates the tokenization
+endpoint against actual chat usage: the endpoint omits the assistant generation
+prefix. Reported prompt lengths include that measured difference.
+
+Long and mixed tests default to a minimum output equal to `--max-output`.
+`--min-output` can override the minimum. Missing overlap, too little output or
+input truncation produces a failed report and nonzero exit status. These are
+capacity tests, not model-quality tests. `min_tokens` suppresses EOS but other
+stop conditions may still end output; actual counts are always checked.
+Reported inter-event gaps are SSE delivery gaps, not exact per-token latency
+when the server groups multiple tokens in one event.
+
+Keep 4.05bpw weights and FP16 cache as the baseline. Default sampling is
+`temperature=1.0, top_p=0.95`, with neutral top-k/min-p/repetition penalties;
+clients may override it. `clear_thinking=true` is explicit for chat.
+Test real retrieval, reasoning, coding and tool workflows separately, including
+facts near the start, middle and end of long histories. Also evaluate follow-up
+turns and prefix reuse; cold-prompt tuning does not characterize every chat.
+
+MTP has target-model verification, but its practical speedup is measured rather
+than assumed. It adds draft weights, cache and recurrent-history storage. If
+plain 4.05bpw quality is inadequate, compare a separately evaluated checkpoint;
+the tuner deliberately does not select more aggressive quantization.
+
+## Operations and validation scope
+
+Warmup shifts initial JIT/autotuning toward model loading. The healthcheck
+checks both `/health` and the expected model/configuration. Docker health status
+alone does not restart a running process; investigate an unhealthy service and
+restart it if recovery fails. The ordinary restart policy handles process exits.
+
+The API binds to localhost. For remote access, use an SSH tunnel:
 
 ```bash
 ssh -N -L 5000:127.0.0.1:5000 your-user@your-server
 ```
 
-Then point the workstation client at `http://127.0.0.1:5000/v1`. For a shared
-LAN deployment, change the bind deliberately and use your existing authenticated
-TLS proxy/firewall. Give that proxy long timeouts for prefill and disable SSE
-buffering. Tabby emits SSE keepalives during long requests.
+For shared LAN access use an authenticated TLS proxy, long prefill timeouts and
+unbuffered SSE. The pinned Tabby version prints API/admin keys at startup;
+limit access to Docker logs. Prompt logging is disabled.
 
-TabbyAPI's pinned upstream version prints API/admin keys at startup, so Docker
-log access must be limited to the operators of this service. Prompt/request
-logging is disabled here.
+Source, wheel, CUDA image and model revisions/hashes are pinned. Supporting
+packages still resolve at build time. Preserve a successful image by digest;
+`/opt/runtime-requirements.txt` records its resolved Python packages. This is
+not a complete transitive reproducibility lock.
 
-## Compare performance on the actual topology
-
-Before serving users, also try native tensor parallel communication or layer
-splitting. With only 1–2 users, avoiding frequent communication with the third
-card may outweigh using all GPUs in parallel. These modes keep the **same
-weights, cache precision and context limits**.
+Run CPU-only development checks with Python and PyYAML installed:
 
 ```bash
-docker compose down
-python3 configure.py --mode layer --force
-docker compose up -d
-# Wait for health; rerun the same smoke/long checks and save a separate report:
-python3 scripts/api_check.py long --users 2 --report reports/layer.json
+python3 -m unittest discover -s tests -v
+python3 autotune.py --plan
 ```
 
-Use `--mode native` for ExLlama's native TP backend or `--mode nccl` to return
-to the default. `--force` regenerates `.env` and `config.yml`, replacing manual
-edits but retaining model data and keys; repeat `--gpus` / `--port` if customized.
-Layer splitting still benefits from peer transfers where the assigned layers
-cross the bridged pair, but performs less work across GPUs simultaneously.
-Select the mode using measured prefill time and decode throughput.
-
-For a bridge-only NCCL diagnostic, run the same `nccl_test.py` command with
-`--nproc_per_node=2` **while the server is stopped**. UUID order ensures those
-two ranks use the paired cards. This tests communication, not model fit on two
-cards. Do not run the GPU diagnostics while a loaded model is using the GPUs.
-
-If loading fails with OOM, first confirm the GPUs are idle and read the logged
-allocation. Try `chunk_size: 1024` or layer mode while retaining the context
-budget. Do not reduce cache size below two context windows and still claim
-two full-context users. If the full test cannot pass, report it as a failed
-capacity target; reducing context, precision or concurrency is a different
-deployment decision. If P2P/NCCL fails, diagnose the host topology, VM
-passthrough and driver/container runtime before changing transport settings.
+See [VALIDATION.md](VALIDATION.md) for what was actually checked. Unit tests and
+mock HTTP streams are not evidence of A100 throughput or model quality.
 
 ## Sources and licenses
 
-- [ExLlamaV3 1.5.1 release: GLM-5.3 TP support](https://github.com/turboderp-org/exllamav3/releases/tag/v1.5.1)
-- [Pinned ExLlama allocator](https://github.com/turboderp-org/exllamav3/blob/958ec933361b24eb8426ec7222e5b0062a679dcd/exllamav3/model/model_tp_alloc.py)
-- [Pinned TabbyAPI configuration](https://github.com/theroyallab/tabbyAPI/blob/f07131cd8fe34e449fe87cdd3a066b52b96d3cac/config_sample.yml)
-- [Pinned upstream Dockerfile](https://github.com/theroyallab/tabbyAPI/blob/f07131cd8fe34e449fe87cdd3a066b52b96d3cac/docker/Dockerfile)
-- [Quantized checkpoint](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/2a30229e67012798ba9f0cd832bb78abf4c363d5)
-- [NCCL transport settings](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-p2p-level)
-- [CUDA 12.8.1 driver release notes](https://docs.nvidia.com/cuda/archive/12.8.1/cuda-toolkit-release-notes/index.html)
+- [ExLlamaV3 1.5.1: GLM-5.3 TP support](https://github.com/turboderp-org/exllamav3/releases/tag/v1.5.1)
+- [Pinned allocator](https://github.com/turboderp-org/exllamav3/blob/958ec933361b24eb8426ec7222e5b0062a679dcd/exllamav3/model/model_tp_alloc.py)
+- [Pinned shared-cache scheduler](https://github.com/turboderp-org/exllamav3/blob/958ec933361b24eb8426ec7222e5b0062a679dcd/exllamav3/generator/generator.py)
+- [Pinned Tabby settings](https://github.com/theroyallab/tabbyAPI/blob/f07131cd8fe34e449fe87cdd3a066b52b96d3cac/config_sample.yml)
+- [Model guidance](https://huggingface.co/zai-org/GLM-5.3-Flash)
+- [Pinned quantized checkpoint](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/2a30229e67012798ba9f0cd832bb78abf4c363d5)
+- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+- [NCCL settings](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-p2p-level)
 
-GLM-5.3-Flash and this EXL3 checkpoint are MIT licensed, permitting commercial
-use subject to the license notices. ExLlamaV3 is MIT. TabbyAPI is AGPL-3.0;
-its license obligations are separate from the model license, particularly if
-you modify the server and provide network access. The image contains upstream
-source and notices; the model download retains its LICENSE file. CUDA/PyTorch
-and other dependencies retain their respective licenses.
-
-These deployment scripts do not patch the inference server. See the upstream
-[model license](https://huggingface.co/zai-org/GLM-5.3-Flash/blob/main/LICENSE),
-[ExLlama license](https://github.com/turboderp-org/exllamav3/blob/v1.5.1/LICENSE)
-and [TabbyAPI license](https://github.com/theroyallab/tabbyAPI/blob/f07131cd8fe34e449fe87cdd3a066b52b96d3cac/LICENSE)
-for their full terms.
+The model/checkpoint and ExLlamaV3 are MIT licensed. TabbyAPI is AGPL-3.0;
+its terms are separate from the model license. This repository configures the
+server without patching its source. The downloaded model retains its LICENSE,
+and the image retains upstream source/notices. CUDA, PyTorch and other
+components retain their respective licenses.

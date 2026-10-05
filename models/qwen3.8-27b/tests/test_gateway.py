@@ -76,22 +76,38 @@ class GatewayTests(unittest.TestCase):
         self.assertIn("no option http-buffer-request", text)
         self.assertIn("option http-no-delay", text)
         self.assertNotIn("compression algo", text)
-        self.assertNotIn("stick-table", text)
-        self.assertIn("server worker2 127.0.0.1:18101 proto h1", text)
+        self.assertNotIn("stick-table type integer", text)
+        self.assertIn("stick-table type string len 128 size 10064 expire 86400s nopurge", text)
+        self.assertIn("deny_status 503 if has_session !known_session { table_cnt(llm_pool) ge 10000 }", text)
+        self.assertIn("track-sc1 req.fhdr(X-Session-ID) table llm_pool if has_session", text)
+        self.assertIn("stick on req.fhdr(X-Session-ID)", text)
+        self.assertIn("deny_status 400 if has_session !single_session", text)
+        self.assertIn("deny_status 400 if has_session !valid_session", text)
+        self.assertIn("del-header X-Qwen-Backend", text)
+        self.assertIn("http-response set-header X-Qwen-Backend %[srv_name]", text)
+        self.assertIn("table_server_id(llm_pool)", text)
+        self.assertIn("str(llm_pool/worker2),srv_queue ge 8", text)
+        self.assertIn("no option redispatch", text)
+        self.assertIn("server worker2 127.0.0.1:18101 id 2 proto h1", text)
 
     def test_overrides_and_optional_rate_limit(self):
         config = {**self.config, "gateway_port": 8000, "gateway_backend_maxconn": 7,
                   "gateway_backend_maxqueue": 3, "gateway_timeout_server_s": 1200,
-                  "gateway_rate_limit_rps": 20, "gateway_max_body_bytes": 12345}
+                  "gateway_rate_limit_rps": 20, "gateway_max_body_bytes": 12345,
+                  "gateway_session_table_size": 500, "gateway_session_ttl_s": 3600}
         item = gateway.Gateway(config, self.directory / "run")
         text = item.export(["http://[::1]:18100/"], self.directory / "explicit.cfg").read_text()
         self.assertIn("bind 127.0.0.1:8000", text)
         self.assertIn("maxconn 7 maxqueue 3", text)
         self.assertIn("queue(llm_pool) ge 3", text)
         self.assertIn("sc_http_req_rate(0) gt 20", text)
+        self.assertIn("http-request track-sc0 int(1)", text)
+        self.assertIn("http-request track-sc1 req.fhdr(X-Session-ID) table llm_pool", text)
         self.assertIn("timeout server 1200s", text)
         self.assertIn("content-length) gt 12345", text)
         self.assertIn("[::1]:18100", text)
+        self.assertIn("stick-table type string len 128 size 564 expire 3600s nopurge", text)
+        self.assertIn("table_cnt(llm_pool) ge 500", text)
 
     def test_rejects_unsafe_backend_urls_and_duplicates(self):
         bad = ["https://localhost:18100", "http://example.com:18100", "http://localhost",
@@ -112,6 +128,8 @@ class GatewayTests(unittest.TestCase):
                             ("gateway_maxconn", 0), ("gateway_backend_maxqueue", 0),
                             ("gateway_timeout_server_s", "900s\nmalicious"),
                             ("gateway_max_body_bytes", -1), ("gateway_rate_limit_rps", -1),
+                            ("gateway_session_table_size", 0), ("gateway_session_table_size", 1000001),
+                            ("gateway_session_ttl_s", True), ("gateway_session_ttl_s", 604801),
                             ("gateway_image", "--privileged"), ("gateway_image", "haproxy:latest"),
                             ("runtime_restart", "surprise")]:
             with self.subTest(name=name, value=value), self.assertRaises(ValueError):

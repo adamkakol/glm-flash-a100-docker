@@ -31,6 +31,7 @@ class Handler(BaseHTTPRequestHandler):
             self.server.paths.append(self.path)
             if self.path.endswith("tokenize"):
                 self.server.tokenized.append(body)
+                self.server.tokenize_sessions.append(self.headers.get("X-Session-ID"))
         if self.path == "/tokenize":
             payload = json.dumps({"count": token_count(body["messages"])}).encode()
             self.send_response(200)
@@ -38,8 +39,16 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
+        session_id = self.headers.get("X-Session-ID")
+        with self.server.lock:
+            backend = self.server.session_backends.setdefault(session_id, "worker" + str(1 + len(self.server.session_backends) % 2))
+            if self.server.mode == "changed_backend":
+                backend = "worker2" if backend == "worker1" else "worker1"
+            self.server.session_requests.append({"session_id": session_id, "backend": backend, "body": body})
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
+        if self.server.mode != "missing_backend":
+            self.send_header("X-Qwen-Backend", backend)
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
@@ -116,6 +125,8 @@ class Handler(BaseHTTPRequestHandler):
             self.event({"choices": [{"delta": {"content": text[midpoint:]}}]})
         count = token_count(messages) + (1 if self.server.mode == "wrong_usage" else 0)
         usage = {"prompt_tokens": count, "completion_tokens": body["max_tokens"] if body.get("min_tokens") else 20}
+        if len(messages) > 1:
+            usage["prompt_tokens_details"] = {"cached_tokens": count + 1 if self.server.mode == "invalid_cache_usage" else token_count(messages[:1])}
         tail = {"choices": [{"delta": {}, "finish_reason": None if self.server.mode == "no_finish" else finish}]}
         if self.server.mode != "no_usage":
             tail["usage"] = usage
@@ -155,6 +166,7 @@ class BenchmarkTests(unittest.TestCase):
         self.server.daemon_threads = True
         self.server.lock = threading.Lock()
         self.server.paths, self.server.tokenized = [], []
+        self.server.tokenize_sessions, self.server.session_requests, self.server.session_backends = [], [], {}
         self.server.mode, self.server.disconnects = "normal", 0
         self.server.responses_followup = self.server.chat_followup = False
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
@@ -189,6 +201,65 @@ class BenchmarkTests(unittest.TestCase):
         self.assertNotIn("secret-test-key", serialized)
         self.assertNotIn("synthetic records", serialized)
         self.assertNotIn("reasoning λ", serialized)
+
+    def test_followup_preserves_sessions_backends_and_grows_exact_chat(self):
+        cold = self.client.run_workload(256, 128, seed=73)
+        self.assertTrue(cold["passed"], cold)
+        cold_requests = list(self.server.session_requests)
+        warm = self.client.run_followup_workload(256, 96, seed=73, max_model_len=1024)
+        self.assertTrue(warm["passed"], warm)
+        self.assertEqual(warm["conversation_mode"], "synthetic_growing_followup")
+        self.assertEqual(len(warm["requests"]), 2)
+        self.assertFalse(warm["short_injected_after_long_decode"])
+        self.assertGreater(warm["long_decode_overlap_s"], 0)
+        for previous, current in zip(cold["requests"][:2], warm["requests"]):
+            self.assertEqual(previous["session_id"], current["session_id"])
+            self.assertEqual(previous["backend"], current["backend"])
+            self.assertEqual(current["expected_backend"], previous["backend"])
+            self.assertGreater(current["input_tokens"], 256)
+            self.assertEqual(current["output_tokens"], 96)
+            self.assertEqual(current["cached_input_tokens"], 256)
+            self.assertNotIn("cached_input_tokens", previous)
+            sent_cold = next(r for r in cold_requests if r["session_id"] == current["session_id"])
+            sent_warm = next(r for r in self.server.session_requests[len(cold_requests):] if r["session_id"] == current["session_id"])
+            self.assertEqual(sent_cold["body"]["messages"][0], sent_warm["body"]["messages"][0])
+            self.assertEqual([m["role"] for m in sent_warm["body"]["messages"]], ["user", "assistant", "user"])
+            self.assertEqual(current["input_tokens"], token_count(sent_warm["body"]["messages"]))
+        self.assertTrue(all(value is None for value in self.server.tokenize_sessions))
+        next_trial = self.client.run_workload(256, 128, seed=74, mixed=False)
+        self.assertTrue(next_trial["passed"], next_trial)
+        self.assertFalse({r["session_id"] for r in cold["requests"]} & {r["session_id"] for r in next_trial["requests"]})
+
+    def test_followup_requires_successful_base_and_context_room(self):
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "successful matching cold"):
+            self.client.run_followup_workload(256, 96, seed=75)
+        self.assertTrue(self.client.run_workload(256, 128, seed=75, mixed=False)["passed"])
+        count = len(self.server.session_requests)
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "context/output budget"):
+            self.client.run_followup_workload(256, 96, seed=75, max_model_len=300)
+        self.assertEqual(count, len(self.server.session_requests))
+
+    def test_followup_rejects_invalid_cached_token_usage(self):
+        self.assertTrue(self.client.run_workload(256, 128, mixed=False)["passed"])
+        self.server.mode = "invalid_cache_usage"
+        result = self.client.run_followup_workload(256, 96, max_model_len=1024)
+        self.assertFalse(result["passed"])
+        self.assertTrue(all("cached-token usage" in error for error in result["errors"].values()))
+
+    def test_session_backend_identity_missing_or_changed_fails(self):
+        self.server.mode = "missing_backend"
+        result = self.client.run_workload(256, 128, mixed=False)
+        self.assertFalse(result["passed"])
+        self.assertTrue(all("X-Qwen-Backend" in error for error in result["errors"].values()))
+        self.server.mode = "normal"
+        cold = self.client.run_workload(256, 128, mixed=False)
+        self.assertTrue(cold["passed"], cold)
+        self.server.mode = "changed_backend"
+        warm = self.client.run_followup_workload(256, 96, max_model_len=1024)
+        self.assertFalse(warm["passed"])
+        self.assertTrue(all("different backend" in error for error in warm["errors"].values()))
+        repeated = self.client.run_workload(256, 128, mixed=False)
+        self.assertFalse(repeated["passed"])
 
     def test_queued_short_request_fails(self):
         self.server.mode = "queue_short"

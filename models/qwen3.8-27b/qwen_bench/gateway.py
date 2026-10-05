@@ -2,6 +2,10 @@
 
 HAProxy streams responses as they arrive. Requests must be stateless: callers
 send the full conversation and use ``store: false`` with the Responses API.
+An optional opaque X-Session-ID retains a healthy replica for prefix-cache reuse.
+Affinity expires and resets on restart. A full table rejects new session IDs
+without evicting existing ones. Affinity does not preserve model state or
+guarantee that the prefix remains cached.
 The loopback endpoint deliberately requires an external TLS ingress for remote
 access. Request bodies require Content-Length; chunked *responses* remain valid.
 """
@@ -187,6 +191,8 @@ class Gateway:
         queued = _integer(self.config, "gateway_backend_maxqueue", 8, maximum=65536)
         body = _integer(self.config, "gateway_max_body_bytes", 64 * 1024 * 1024)
         rate = _integer(self.config, "gateway_rate_limit_rps", 0, minimum=0, maximum=1000000)
+        sessions = _integer(self.config, "gateway_session_table_size", 10000, maximum=1000000)
+        session_ttl = _integer(self.config, "gateway_session_ttl_s", 86400, maximum=604800)
         timeouts = {key: _integer(self.config, f"gateway_timeout_{key}_s", default, maximum=86400)
                     for key, default in (("connect", 5), ("queue", 30), ("client", 900), ("server", 900))}
         key_file = _get(self.config, "api_key_file")
@@ -218,6 +224,7 @@ class Gateway:
             "    no option http-buffer-request",
             "    retries 0",
             "    retry-on none",
+            "    no option redispatch",
             "    timeout http-request 30s",
             "    timeout http-keep-alive 15s",
         ]
@@ -232,6 +239,13 @@ class Gateway:
             "    acl single_auth req.fhdr_cnt(authorization) eq 1",
             f"    acl authorized req.fhdr(authorization),sha2(256),hex -m str -i {digest}",
             "    http-request return status 401 hdr WWW-Authenticate Bearer unless single_auth authorized",
+            "    acl has_session req.fhdr_cnt(X-Session-ID) gt 0",
+            "    acl single_session req.fhdr_cnt(X-Session-ID) eq 1",
+            "    acl valid_session req.fhdr(X-Session-ID) -m reg ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+            "    http-request deny deny_status 400 if has_session !single_session",
+            "    http-request deny deny_status 400 if has_session !valid_session",
+            "    http-request del-header X-Qwen-Backend",
+            "    http-request set-var(txn.affinity_server) req.fhdr(X-Session-ID),table_server_id(llm_pool) if has_session",
             "    # Known length makes the body cap enforceable without buffering uploads.",
             "    http-request return status 411 if { req.hdr_cnt(transfer-encoding) gt 0 }",
             "    acl body_method method POST PUT PATCH",
@@ -240,6 +254,13 @@ class Gateway:
             f"    http-request deny deny_status 413 if {{ req.hdr_val(content-length) gt {body} }}",
             f"    http-request deny deny_status 503 if {{ queue(llm_pool) ge {queued * len(addresses)} }}",
         ]
+        # HAProxy's maxqueue can otherwise break persistence when the selected
+        # server fills. Reject that case before selection, preserving the cache
+        # affinity while allowing an already-down server to be replaced.
+        for index in range(1, len(addresses) + 1):
+            lines.append(f"    http-request deny deny_status 503 if {{ var(txn.affinity_server) -m int eq {index} }} "
+                         f"{{ srv_is_up(llm_pool/worker{index}) }} "
+                         f"{{ str(llm_pool/worker{index}),srv_queue ge {queued} }}")
         if rate:
             lines += [
                 "    stick-table type integer size 1 expire 10s store http_req_rate(1s)",
@@ -247,17 +268,27 @@ class Gateway:
                 f"    http-request deny deny_status 429 if {{ sc_http_req_rate(0) gt {rate} }}",
             ]
         lines += [
+            "    # Reserve the entry before asynchronous backend selection. SC0 is reserved for rate limits.",
+            "    acl known_session req.fhdr(X-Session-ID),in_table(llm_pool) -m bool",
+            f"    http-request deny deny_status 503 if has_session !known_session {{ table_cnt(llm_pool) ge {sessions} }}",
+            "    http-request track-sc1 req.fhdr(X-Session-ID) table llm_pool if has_session",
             "    default_backend llm_pool",
             "",
             "backend llm_pool",
             "    balance leastconn",
+            "    # stick-on allocates a temporary record even for a key already reserved by SC1.",
+            "    # One spare record per frontend connection avoids losing the last admitted mapping.",
+            "    # Admission above still enforces the configured conversation limit.",
+            f"    stick-table type string len 128 size {sessions + maximum} expire {session_ttl}s nopurge",
+            "    stick on req.fhdr(X-Session-ID) if { req.fhdr_cnt(X-Session-ID) eq 1 }",
+            "    http-response set-header X-Qwen-Backend %[srv_name]",
             "    http-reuse safe",
             "    option httpchk",
             "    http-check send meth GET uri /health ver HTTP/1.1 hdr Host localhost",
             "    http-check expect status 200",
             f"    default-server check inter 2s fall 3 rise 1 init-state fully-down maxconn {active} maxqueue {queued}",
         ]
-        lines.extend(f"    server worker{index} {address} proto h1" for index, address in enumerate(addresses, 1))
+        lines.extend(f"    server worker{index} {address} id {index} proto h1" for index, address in enumerate(addresses, 1))
         return "\n".join(lines) + "\n"
 
     def export(self, backends, destination):

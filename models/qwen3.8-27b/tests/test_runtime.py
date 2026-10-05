@@ -135,7 +135,7 @@ class RuntimeTests(unittest.TestCase):
         self.topo = detect_gpus(self.cfg, self.runner)
         self.runtime = DockerRuntime(self.cfg, Path(self.tmp.name) / "run", runner=self.runner, topology=self.topo)
         self.candidate = Candidate("bf16-tp2-c2048-mtp0", "bf16", "tp2", 2048)
-        sockets = patch("qwen_bench.runtime.socket.socket")
+        sockets = patch("qwen_bench.ports.socket.socket")
         sockets.start()
         self.addCleanup(sockets.stop)
 
@@ -150,6 +150,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn(self.runtime.api_key, " ".join(cmd))
         self.assertNotIn("--language-model-only", cmd)
         self.assertIn("--no-enable-log-requests", cmd)
+        self.assertIn("--enable-prompt-tokens-details", cmd)
         self.assertEqual("auto", cmd[cmd.index("--kv-cache-dtype") + 1])
         self.assertEqual("bfloat16", cmd[cmd.index("--dtype") + 1])
         overrides = json.loads(cmd[cmd.index("--hf-overrides") + 1])
@@ -164,6 +165,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(3, len(commands))
         self.assertEqual(3, len({cmd[cmd.index("--gpus") + 1] for cmd in commands}))
         for cmd in commands:
+            self.assertIn("--enable-prompt-tokens-details", cmd)
             self.assertEqual("1", cmd[cmd.index("--tensor-parallel-size") + 1])
             self.assertEqual("fp8", cmd[cmd.index("--quantization") + 1])
             self.assertEqual(3, json.loads(cmd[cmd.index("--speculative-config") + 1])["num_speculative_tokens"])
@@ -205,6 +207,26 @@ class RuntimeTests(unittest.TestCase):
             self.runtime.start(self.candidate)
         sleep.assert_called_once_with(1)
         self.runtime.stop()
+
+    def test_port_preflight_runs_before_gpu_queries_or_docker_launch(self):
+        self.runner.calls.clear()
+        with patch("qwen_bench.runtime.check_ports", side_effect=RuntimeError("gateway TCP port 127.0.0.1:18080 is in use")):
+            with self.assertRaisesRegex(RuntimeError, "18080"):
+                self.runtime.start(self.candidate)
+        self.assertEqual([], self.runner.calls)
+
+    def test_late_docker_port_collision_reports_port_and_cleans_up(self):
+        runner = self.runtime.runner
+        def race(command, timeout=30):
+            result = runner(command, timeout=timeout)
+            if command[:2] == ["docker", "run"]:
+                return subprocess.CompletedProcess(command, 125, "", "port is already allocated")
+            return result
+        self.runtime.runner = race
+        with self.assertRaisesRegex(RuntimeError, "backend 0 on 127.0.0.1:18100: port is already allocated"):
+            self.runtime.start(self.candidate)
+        self.assertEqual({}, self.runner.owners)
+        self.assertFalse(self.runtime.env_file.exists())
 
     def test_start_never_retries_an_active_compute_process(self):
         self.runner.inventory = INVENTORY.replace(", 0, 0,", ", 0, 75,", 1)

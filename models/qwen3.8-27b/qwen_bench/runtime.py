@@ -13,7 +13,6 @@ import os
 from pathlib import Path
 import re
 import secrets
-import socket
 import subprocess
 import time
 from typing import Callable
@@ -22,6 +21,7 @@ import urllib.request
 import uuid
 
 from .state import atomic_json
+from .ports import check_ports, validate_port_layout
 
 
 OWNER_LABEL = "io.qwen-bench.run"
@@ -130,8 +130,7 @@ def validate_config(config: dict) -> None:
         raise ValueError("input plus output exceeds max_model_len")
     if config["target_input_tokens"] < 260000 or config["max_num_seqs"] < 3:
         raise ValueError("retain the 260k target and at least three scheduler slots")
-    if type(config["base_port"]) is not int or not 1024 <= config["base_port"] <= 65533:
-        raise ValueError("base_port must allow three consecutive unprivileged ports")
+    validate_port_layout(config)
     if not isinstance(config["gpu_memory_utilization"], (int, float)) or not 0.5 <= config["gpu_memory_utilization"] <= 0.95:
         raise ValueError("gpu_memory_utilization must be between 0.5 and 0.95")
     if config["kv_cache_dtype"] != "bfloat16":
@@ -392,6 +391,7 @@ class DockerRuntime:
                 "--max-num-batched-tokens", str(candidate.chunk_size),
                 "--gpu-memory-utilization", str(cfg["gpu_memory_utilization"]),
                 "--enable-chunked-prefill", "--enable-prefix-caching",
+                "--enable-prompt-tokens-details",
                 "--mamba-cache-mode", "align", "--reasoning-parser", "qwen3",
                 "--enable-auto-tool-choice", "--tool-call-parser", "qwen3_xml",
                 "--default-chat-template-kwargs", json.dumps({"reasoning_effort": cfg.get("reasoning_effort", "xhigh")}),
@@ -478,6 +478,9 @@ class DockerRuntime:
     def start(self, candidate: Candidate) -> list[str]:
         if self.containers:
             raise RuntimeError("stop this runtime's previous candidate before starting another")
+        if candidate not in generate_candidates(self.config):
+            raise ValueError("candidate is outside the configured, supported matrix")
+        check_ports(self.config, backend_count=1 if candidate.layout == "tp2" else 3, runner=self.runner)
         # Always refresh before claiming an idle device, even after a previous detection.
         detected = _detect_quiescent_gpus(self.config, self.runner)
         if self.topology and detected.nvlink_pair != self.topology.nvlink_pair:
@@ -486,19 +489,17 @@ class DockerRuntime:
         commands = self.launch_commands(candidate)
         self._candidate = candidate
         self._capacities.clear()
-        for index in range(len(commands)):
-            with socket.socket() as probe:
-                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                try:
-                    probe.bind(("127.0.0.1", self.config["base_port"] + index))
-                except OSError as exc:
-                    raise RuntimeError("a benchmark backend port is already in use") from exc
         try:
             for index, command in enumerate(commands):
                 name = command[command.index("--name") + 1]
                 self.containers.append({"name": name, "url": f"http://127.0.0.1:{self.config['base_port'] + index}"})
                 self._persist()
-                _checked(self.runner, command, timeout=60)
+                result = self.runner(command, timeout=60)
+                if result.returncode:
+                    detail = (result.stderr or result.stdout).replace(self.api_key, "[REDACTED]")[-1600:].strip()
+                    raise RuntimeError(f"Docker could not start backend {index} on "
+                                       f"127.0.0.1:{self.config['base_port'] + index}: "
+                                       f"{detail or ('exit ' + str(result.returncode))}")
             # Docker has already stored the environment; restart needs no host copy.
             self.env_file.unlink(missing_ok=True)
             deadline = time.monotonic() + self.config["startup_timeout_s"]

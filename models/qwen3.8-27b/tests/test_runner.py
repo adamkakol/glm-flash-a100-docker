@@ -43,7 +43,9 @@ class PolicyTests(unittest.TestCase):
             for change in ({"output_tokens": 256}, {"repetitions": 1}, {"max_model_len": 262144},
                            {"latency_budgets": {"ttft_s": float("nan")}},
                            {"docker_image": "vllm/vllm-openai:latest"},
-                           {"gateway_image": "haproxy:3.2.25-alpine"}):
+                           {"gateway_image": "haproxy:3.2.25-alpine"},
+                           {"decode_speed_tolerance": .5}, {"warm_prefix_trial": False},
+                           {"minimum_prefix_cache_hit_ratio": float("nan")}):
                 path.write_text(json.dumps({**runner.settings(), **change}))
                 with self.subTest(change=change), self.assertRaises(ValueError):
                     runner.read_config(path)
@@ -78,6 +80,30 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(runner.main(["--config", str(Path(tmp) / "absent.json"), "cleanup", tmp]), 0)
             recover.assert_called_once_with(Path(tmp))
 
+    def test_preflight_ports_fail_before_any_gpu_query(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            path = Path(tmp) / "config.json"
+            runner.init_config(path)
+            with patch.object(runner, "check_ports", side_effect=RuntimeError("gateway port occupied")), \
+                    patch.object(runner, "detect_gpus") as detect, patch.object(runner, "REPO", Path(tmp)):
+                with self.assertRaisesRegex(RuntimeError, "port occupied"):
+                    runner.main(["--config", str(path), "preflight"])
+                detect.assert_not_called()
+
+    def test_serve_checks_its_actual_port_before_gpu_queries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "recommendation.json"
+            report.write_text(json.dumps({"fingerprint": "fixture", "qualification": {"passed": True},
+                                          "candidate": {"layout": "tp2"}}))
+            config = runner.settings()
+            with patch.object(runner, "fingerprint", return_value="fixture"), \
+                    patch.object(runner, "check_ports", side_effect=RuntimeError("public port occupied")) as ports, \
+                    patch.object(runner, "detect_gpus") as detect:
+                with self.assertRaisesRegex(RuntimeError, "public port occupied"):
+                    runner.serve(report, config, 8123)
+                ports.assert_called_once_with(config, backend_count=1, gateway_port=8123)
+                detect.assert_not_called()
+
     def test_evaluate_requires_capacity_then_repeats_real_target_and_warm_trial(self):
         candidate = Candidate("bf16-tp2-c2048-mtp0", "bf16", "tp2", 2048, 0)
         requests = [{"request": i, "output_tokens_per_second": 30, "ttft_s": 10,
@@ -93,6 +119,7 @@ class PolicyTests(unittest.TestCase):
         client.smoke.side_effect = lambda: {"passed": True}
         client.long_retrieval.return_value = {"passed": True}
         client.run_workload.side_effect = lambda *a, **k: dict(workload)
+        client.run_followup_workload.side_effect = lambda *a, **k: dict(workload)
         telemetry.summary.return_value = {"passed": True, "counter_deltas": {}}
         context = contextlib.nullcontext(telemetry)
         with tempfile.TemporaryDirectory() as tmp, \
@@ -100,16 +127,22 @@ class PolicyTests(unittest.TestCase):
                 patch.object(runner, "Gateway", return_value=gateway), \
                 patch.object(runner, "make_client", return_value=client), \
                 patch.object(runner, "Telemetry", return_value=context), \
+                patch.object(runner, "assess_cache", return_value={"passed": True}), \
                 patch.object(runner, "wait_idle", return_value={"passed": True}):
             result = runner.evaluate(runner.settings(), candidate, "qualify", Path(tmp), Mock())
         self.assertTrue(result["passed"], result)
         self.assertEqual(client.smoke.call_count, 3)
-        self.assertEqual(client.run_workload.call_count, 3)
+        self.assertEqual(client.run_workload.call_count, 2)
+        self.assertEqual(client.run_followup_workload.call_count, 2)
         calls = client.run_workload.call_args_list
         self.assertTrue(all(call.args == (260000, 32768) for call in calls))
         self.assertNotEqual(calls[0].kwargs["seed"], calls[1].kwargs["seed"])
-        self.assertEqual(calls[1].kwargs["seed"], calls[2].kwargs["seed"])
-        self.assertEqual([t["cache_mode"] for t in result["trials"]], ["distinct_prefix", "distinct_prefix", "reused_prefix"])
+        for cold, warm in zip(calls, client.run_followup_workload.call_args_list):
+            self.assertEqual(cold.kwargs["seed"], warm.kwargs["seed"])
+            self.assertEqual(warm.args, (260000, 1024))
+            self.assertEqual(warm.kwargs["max_model_len"], 327680)
+        self.assertEqual([t["cache_mode"] for t in result["trials"]],
+                         ["distinct_prefix", "growing_followup", "distinct_prefix", "growing_followup"])
         runtime.stop.assert_called_once()
         gateway.stop.assert_called_once()
 
@@ -119,6 +152,24 @@ class PolicyTests(unittest.TestCase):
             result = {"passed": True, "concurrency": 1, "requests": [
                 {"request": 0, "output_tokens_per_second": rate}, {"request": 1}]}
             self.assertEqual(runner.cost(result), float("inf"))
+
+    def test_compare_legacy_report_is_offline_and_does_not_rewrite_winner(self):
+        workload = {"passed": True, "concurrency": 2, "cache_mode": "distinct_prefix", "requests": [
+            {"request": i, "output_tokens_per_second": rate, "ttft_s": 3, "max_useful_gap_s": .1}
+            for i, rate in enumerate([60, 58, 20])]}
+        record = {"winner": {"layout": "replicas"}, "results": {"qualify/tp2":
+            {"passed": True, "candidate": {"layout": "tp2"}, "trials": [workload]}}}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(runner.subprocess, "run", side_effect=AssertionError("process started")):
+            path = Path(tmp) / "run.json"
+            path.write_text(json.dumps(record))
+            before = path.read_bytes()
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(runner.main(["--config", str(Path(tmp) / "missing"), "compare", tmp]), 0)
+            result = json.loads(output.getvalue())
+            self.assertEqual(result["results"][0]["measured_metrics"]["slower_user_tokens_per_second"], 58)
+            self.assertFalse(result["results"][0]["session_cache_qualified"])
+            self.assertEqual(before, path.read_bytes())
 
 
 class StagedRunTests(unittest.TestCase):
@@ -140,6 +191,7 @@ class StagedRunTests(unittest.TestCase):
         self.addCleanup(stack.close)
         stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
         stack.enter_context(patch.object(runner, "detect_gpus", return_value=Mock()))
+        stack.enter_context(patch.object(runner, "check_ports", return_value={}))
         stack.enter_context(patch.object(runner, "hardware_identity", return_value={"fixture": "stable"}))
         stack.enter_context(patch.object(runner, "evaluate", side_effect=evaluation))
         return root, config, calls

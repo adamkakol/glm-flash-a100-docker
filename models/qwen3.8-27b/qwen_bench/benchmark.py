@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import base64
 import http.client
+import hashlib
+import re
 import json
 import random
 import socket
@@ -75,6 +77,7 @@ class BenchmarkClient:
         self.budgets.update(latency_budgets or {})
         self.video_fixture_url = video_fixture_url
         self._lock, self._connections = threading.Lock(), set()
+        self._session_backends, self._successful_bases = {}, {}
 
     def _notify(self, **event):
         # Callbacks receive metrics and stage names, never prompts or credentials.
@@ -136,7 +139,7 @@ class BenchmarkClient:
             connection._benchmark_useful_deadline = deadline
             connection._benchmark_useful_condition.notify_all()
 
-    def _open(self, endpoint, payload, deadline, useful_deadline=None):
+    def _open(self, endpoint, payload, deadline, useful_deadline=None, extra_headers=None):
         cls = http.client.HTTPSConnection if self.url.scheme == "https" else http.client.HTTPConnection
         connect_deadline = min(deadline, useful_deadline) if useful_deadline is not None else deadline
         connection = cls(self.url.hostname, self.url.port,
@@ -144,6 +147,7 @@ class BenchmarkClient:
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
         if self.api_key:
             headers["Authorization"] = "Bearer " + self.api_key
+        headers.update(extra_headers or {})
         with self._lock:
             self._connections.add(connection)
         timer = threading.Timer(max(.001, deadline - time.monotonic()), self._abort, args=(connection,))
@@ -261,15 +265,22 @@ class BenchmarkClient:
         return payload
 
     def _stream(self, endpoint, payload, expected_input=None, stress=False,
-                on_first=None, cancel_after_first=False):
+                on_first=None, cancel_after_first=False, session_id=None, expected_backend=None):
         started = time.monotonic()
         deadline = started + (min(self.timeout, 30) if cancel_after_first else self.timeout)
         first_deadline = min(deadline, started + self.budgets.get("ttft_s", self.timeout))
-        connection, response = self._open(endpoint, payload, deadline, first_deadline)
+        headers = {"X-Session-ID": session_id} if session_id else None
+        connection, response = self._open(endpoint, payload, deadline, first_deadline, headers)
         response_calls = {}
         first, last, gaps, usage, finish = None, None, [], None, None
         text, tools, outputs, done, terminal, cancelled = [], {}, [], False, False, False
         try:
+            backend = response.getheader("X-Qwen-Backend")
+            if session_id:
+                if not backend or not re.fullmatch(r"worker[1-3]", backend):
+                    raise BenchmarkError("session workload lacks a valid X-Qwen-Backend response header")
+                if expected_backend is not None and backend != expected_backend:
+                    raise BenchmarkError("session was routed to a different backend than its preceding request")
             content_type = response.getheader("Content-Type", "")
             if "text/event-stream" not in content_type:
                 raise BenchmarkError("stream response is not text/event-stream")
@@ -399,6 +410,16 @@ class BenchmarkClient:
                       "end_to_end_tokens_per_second": count_out / (ended - started),
                       "started_at": started, "first_useful_at": first, "last_useful_at": last, "ended_at": ended,
                       "text": "".join(text), "tool_calls": list(tools.values()), "output": outputs}
+            if session_id:
+                result.update(session_id=session_id, backend=backend, expected_backend=expected_backend)
+            for detail_key in ("prompt_tokens_details", "input_tokens_details"):
+                details = usage.get(detail_key)
+                if isinstance(details, dict) and details.get("cached_tokens") is not None:
+                    cached = details["cached_tokens"]
+                    if type(cached) is not int or not 0 <= cached <= count_in:
+                        raise BenchmarkError("server cached-token usage is invalid")
+                    result["cached_input_tokens"] = cached
+                    result["cache_usage_source"] = detail_key + ".cached_tokens"
             violations = []
             for metric in ("ttft_s", "max_useful_gap_s", "duration_s"):
                 if metric in self.budgets and result[metric] > self.budgets[metric]:
@@ -412,11 +433,46 @@ class BenchmarkClient:
     def _public(result):
         return {k: v for k, v in result.items() if k not in ("text", "tool_calls", "output")}
 
+    def _session_id(self, seed, user):
+        value = f"{self.model}:{seed}:{user}".encode()
+        return "qbench-" + hashlib.sha256(value).hexdigest()[:32]
+
     def run_workload(self, input_tokens, output_tokens, concurrency=2, mixed=True,
                      seed=1, reasoning_effort="xhigh"):
         if min(input_tokens, output_tokens, concurrency) < 1:
             raise ValueError("token budgets and concurrency must be positive")
         prompts = [self.exact_prompt(input_tokens, seed + i * 104729, reasoning_effort) for i in range(concurrency)]
+        result = self._run_prompts(prompts, [input_tokens] * concurrency, output_tokens, mixed, seed, reasoning_effort)
+        result["conversation_mode"] = "single_turn"
+        key = (seed, concurrency, input_tokens, reasoning_effort)
+        if result["passed"]:
+            self._successful_bases[key] = prompts
+        else:
+            self._successful_bases.pop(key, None)
+        return result
+
+    def run_followup_workload(self, input_tokens, output_tokens=1024, concurrency=2,
+                              seed=1, reasoning_effort="xhigh", max_model_len=327680):
+        """Growing chat with a controlled synthetic assistant turn, not model output."""
+        if min(input_tokens, output_tokens, concurrency, max_model_len) < 1:
+            raise ValueError("token budgets, context limit and concurrency must be positive")
+        base = self._successful_bases.get((seed, concurrency, input_tokens, reasoning_effort))
+        if base is None or any(self._session_id(seed, i) not in self._session_backends for i in range(concurrency)):
+            raise BenchmarkError("follow-up requires a successful matching cold workload and backend identities")
+        prompts = [messages + [
+            {"role": "assistant", "content": "The next validation step should cover empty inputs and duplicate records."},
+            {"role": "user", "content": "Extend the Python validation implementation for those cases and explain the checks in detail."}
+        ] for messages in base]
+        counts = [self.tokenize(messages, reasoning_effort) for messages in prompts]
+        if any(count <= input_tokens or count + output_tokens > max_model_len for count in counts):
+            raise BenchmarkError("growing follow-up exceeds context/output budget or did not preserve the base input")
+        result = self._run_prompts(prompts, counts, output_tokens, False, seed, reasoning_effort)
+        result.update(conversation_mode="synthetic_growing_followup", base_input_tokens=input_tokens,
+                      requested_input_tokens=counts, max_model_len=max_model_len)
+        return result
+
+    def _run_prompts(self, prompts, targets, output_tokens, mixed, seed, reasoning_effort):
+        concurrency, input_tokens = len(prompts), targets[0]
         short_target = min(512, input_tokens)
         short_prompt = self.exact_prompt(short_target, seed + 999983, reasoning_effort) if mixed else None
         self._notify(stage="prompts_tokenized", input_tokens=input_tokens, concurrency=concurrency)
@@ -431,8 +487,14 @@ class BenchmarkClient:
                     if synchronized:
                         decoding[index].set()
                     self._notify(stage="decoding", request=index)
+                session_id = self._session_id(seed, index)
+                with self._lock:
+                    expected_backend = self._session_backends.get(session_id)
                 result = self._stream("chat/completions", self._chat_payload(messages, output, reasoning_effort, True),
-                                      target, True, first)
+                                      target, True, first, session_id=session_id, expected_backend=expected_backend)
+                if result["passed"]:
+                    with self._lock:
+                        self._session_backends[session_id] = result["backend"]
                 with lock:
                     results[index] = result
                 self._notify(stage="request_completed", request=index, metrics=self._public(result))
@@ -440,7 +502,7 @@ class BenchmarkClient:
                 with lock:
                     failures[index] = self._error(exc)
                 self._notify(stage="request_failed", request=index, error=type(exc).__name__)
-        threads = [threading.Thread(target=worker, args=(i, prompt, input_tokens, output_tokens, True), daemon=True)
+        threads = [threading.Thread(target=worker, args=(i, prompt, targets[i], output_tokens, True), daemon=True)
                    for i, prompt in enumerate(prompts)]
         for thread in threads:
             thread.start()

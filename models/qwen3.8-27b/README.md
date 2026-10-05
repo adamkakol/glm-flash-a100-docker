@@ -4,6 +4,8 @@ A staged vLLM benchmark and deployment launcher for two concurrent users with
 **260,000 input tokens plus 32,768 generated tokens each**. It compares the
 NVLink pair against independent replicas, retains image/video support, and
 exports a deployment recommendation only after all required checks pass.
+Selection prioritizes the generation rate experienced by the **slower of two
+active users**, with measured session-cache reuse on follow-up requests.
 
 **Validation boundary:** the host logic and real HAProxy proxy have been tested
 locally. No Qwen weights were downloaded and no A100 inference was performed
@@ -93,13 +95,17 @@ are implemented.
 
 1. **Screen:** eight non-speculative configurations, each at two 8k inputs and
    512-token outputs, plus a short request arriving during both decodes.
-2. **Refine:** the two selected configurations and their MTP variants at two
-   65,536-token inputs and 1,024-token outputs. Preserve a viable BF16 reference
-   when possible. Requested MTP must actually produce draft-token metrics.
-3. **Qualify:** two finalists undergo repeated functional checks, simultaneous
-   long-context retrieval, two trials of two distinct 260k inputs with **32k
-   forced output tokens per user**, and a separate repeated-prefix trial. A
-   third short request must emit output while both long sessions are decoding.
+2. **Refine:** selected configurations and their MTP variants at two 65,536-token
+   inputs and 1,024-token outputs. Keep the best passing candidate from **each
+   layout**, plus a viable BF16 reference. The `finalists` setting is a minimum:
+   coverage can require three candidates. Requested MTP must produce draft metrics.
+3. **Qualify:** preserve both viable layouts again, then run repeated functional
+   checks, simultaneous long-context retrieval, and two trials of two distinct
+   260k inputs with **32k forced output tokens per user**. A third short request
+   must emit output during both decodes. Immediately after each cold trial, run
+   two growing-conversation follow-ups with 1,024 output tokens each. These retain
+   the original user prompt and append a controlled synthetic assistant/user
+   exchange; they do not replay the forced-length stress response as real history.
 
 Before benchmarking, observed vLLM KV-capacity logs must cover two configured
 windows for TP2, or one window **on every replica**. Unknown capacity fails.
@@ -111,9 +117,13 @@ every backend must return to zero running/waiting requests within 30 seconds.
 Prompt length is counted by the running server's `/tokenize` endpoint with its
 chat template and checked against inference usage. A mismatch fails instead of
 silently truncating input. Different users get different initial prompt content.
-The repeated-prefix trial is reported separately; cache-hit counters establish
-whether a replica actually reused its prefix. It is excluded from the cold-score
-ranking, so routing luck cannot make it win.
+Each load request sends a stable `X-Session-ID`; follow-ups must return the same
+`X-Qwen-Backend`. vLLM reports `prompt_tokens_details.cached_tokens` for each
+request. **Each** follow-up must reuse at least 80% of its input by default
+(`minimum_prefix_cache_hit_ratio`), and the report includes the actual ratios.
+Missing per-request cache evidence fails qualification; aggregate counters cannot
+hide one user missing their cache. Prefix caching primarily improves prefill/TTFT;
+it does not make single-GPU token generation equivalent to TP2.
 
 Default acceptance budgets are **300 seconds to first useful output**,
 **120 seconds between useful output events**, no observed KV preemption, and
@@ -123,11 +133,18 @@ absent concurrent decode, metric outage or memory-margin failure rejects the
 candidate. Comments/keepalives do not count as generated output. Sampling cannot
 prove the absence of sub-sample memory spikes; actual request failure also rejects.
 
-Successful candidates are ranked by a weighted geometric cost: 50% slower-user
-seconds per output token, 25% worst long-request TTFT, 15% short-request TTFT,
-10% worst useful-event pause. Final ranking uses the median of cold-trial costs.
-Token counts come from usage, never SSE event counts. Decode rate spans the first
-to last useful output; batched streaming events make this a delivery-rate estimate.
+Selection policy `two-user-decode-v2` first finds the fastest **slower-user**
+generation rate, using the median of cold-trial seconds per token. Only candidates
+within 5% of that speed (`decode_speed_tolerance: 0.05`) can win a latency tie.
+Within that band, prefer lower warm-follow-up TTFT, then cold TTFT, useful-output
+pause, and third-request TTFT. Set the tolerance to zero for strict fastest-decode
+selection. A configuration with half the generation speed cannot win because of
+faster prefill or an idle third GPU. Reliability/latency limits remain hard gates.
+
+The recommendation includes the measured metrics of every qualified finalist and
+the policy used. Token counts come from usage, never SSE event counts. Decode rate
+spans first to last useful output; batched streaming makes it a delivery-rate
+estimate. Compare TP2 and replicas under the same two-active-user workload.
 
 Forced-length stress output is a capacity/performance test, **not an intelligence
 test**. Known-answer/tool/retrieval gates catch regressions, but do not establish
@@ -150,6 +167,8 @@ completed metrics. Counts are per stage, not a claim that the entire run is done
 
 ```bash
 python3 bench.py status
+# Read existing reports without GPUs, config, downloads, or changing a winner:
+python3 bench.py compare reports/run-YYYYMMDD-HHMMSS-ID
 tail -f reports/run-*/progress.log
 
 # Resume the specific run directory printed by the previous invocation:
@@ -163,6 +182,11 @@ python3 bench.py run --resume reports/run-YYYYMMDD-HHMMSS-ID --retry-failed
 python3 bench.py cleanup reports/run-YYYYMMDD-HHMMSS-ID
 python3 bench.py cleanup state/download
 ```
+
+Old reports remain readable through `compare`, including reports from the legacy
+blended-score selector. They are **not** qualified under the new affinity/cache
+policy. The new source fingerprint requires a new run; do not bypass it to serve
+an old recommendation. Existing downloaded checkpoints are reused.
 
 Completed results survive interruption. Changing configuration, code, GPU UUIDs,
 topology or driver requires a fresh run. Each candidate has `result.json`, bounded
@@ -193,7 +217,13 @@ running service. `stop` and `cleanup` work even if config or API-key files were 
 Endpoint: `http://127.0.0.1:8000/v1`, model name **`qwen3.8-27b`**. Read the API
 key from `secrets/api-key`; it is never printed in a plan or report. Backends bind
 only to loopback on ports 18100–18102; the benchmark gateway uses port 18080.
-Choose different ports in config if needed **before** benchmarking.
+`preflight`, `run`, and `serve` check exact frontend/backend ports before loading
+weights, including Docker NAT port reservations and host listeners. Gateway and
+backend ports may not overlap. Conflicts report the address and owner when
+available; the tool never kills another service or silently changes the endpoint.
+Choose different `base_port` / `gateway_port` values in your existing `config.json`
+before benchmarking. `serve --port` is checked independently. A bind race can
+still fail at actual launch; its Docker error is retained and owned workers cleaned.
 
 HAProxy is pinned, streams without response buffering, requires authentication,
 limits request bodies to 64 MiB, and has bounded admission: four active and eight
@@ -202,6 +232,23 @@ frontend ceiling. Excess load receives HTTP 503 or waits within those bounds.
 POST requests are never automatically replayed. Request uploads must include
 Content-Length (normal JSON SDK requests do); chunked uploads are rejected.
 Clients should handle overload deliberately rather than retrying immediately.
+
+### Session affinity for replicas
+
+Clients must send **one unique, stable `X-Session-ID` per conversation**, on every
+turn. Accepted IDs contain 1–128 ASCII letters/digits/`.`/`_`/`-`, starting with a
+letter or digit. The first request uses least-connections routing; subsequent
+requests stay on that healthy backend, including queueing there when it is busy.
+`X-Qwen-Backend` in the response identifies `worker1`, `worker2`, or `worker3`.
+Without the session header, routing remains least-connections and cache locality
+is not assured. Do not use the shared API key or one global ID as the session ID.
+
+This is session affinity, not cross-GPU cache sharing or a cache-content-aware
+router. The mapping table defaults to 10,000 sessions and a 24-hour inactivity
+expiry. At the session limit, new IDs receive HTTP 503; established mappings
+are retained. Gateway restart, expiry, or backend failure can change assignment; vLLM
+may also evict prefixes. The benchmark tests live affinity and actual cached-token
+reuse. TP2 has one backend/cache pool and does not require replica selection.
 
 Responses clients must send **full conversation history with `store:false`**.
 Cross-replica `previous_response_id` state, WebSockets, hosted web search,
@@ -232,6 +279,7 @@ model_reasoning_effort = "xhigh"
 name = "Qwen on A100"
 base_url = "http://127.0.0.1:8000/v1"
 env_key = "QWEN_API_KEY"
+env_http_headers = { "X-Session-ID" = "QWEN_SESSION_ID" }
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
@@ -239,6 +287,14 @@ stream_idle_timeout_ms = 300000
 request_max_retries = 0
 stream_max_retries = 0
 ```
+
+For a dedicated CLI process/conversation, set an opaque `QWEN_SESSION_ID` before
+launching Codex and retain it when resuming that conversation. Use different IDs
+for the two users. The provider setting above is process-level; it **does not**
+automatically generate a different ID for every chat in one desktop process.
+A client managing multiple conversations must attach a per-conversation header,
+or use TP2 to avoid replica-affinity requirements. See the [official provider
+header configuration](https://learn.chatgpt.com/docs/config-file/config-reference).
 
 Start with retries disabled so protocol failures remain visible. Verify a real
 multi-turn coding task with your installed Codex version: the protocol tests do

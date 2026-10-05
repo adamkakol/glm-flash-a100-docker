@@ -11,14 +11,16 @@ from pathlib import Path
 import re
 import secrets
 import signal
-import statistics
 import subprocess
 import sys
 import time
 import urllib.request
 
 from .benchmark import BenchmarkClient
+from .cache_check import assess as assess_cache
 from .gateway import Gateway, recover as recover_gateway
+from .ranking import POLICY, cost, describe, shortlist
+from .ports import check_ports, validate_port_layout
 from .runtime import Candidate, DockerRuntime, default_config, detect_gpus, generate_candidates, recover as recover_runtime, validate_config
 from .state import Progress, atomic_json, exclusive, fingerprint
 from .telemetry import Telemetry, wait_idle
@@ -37,6 +39,8 @@ def settings() -> dict:
         "screen_input_tokens": 8192, "screen_output_tokens": 512,
         "refine_input_tokens": 65536, "refine_output_tokens": 1024,
         "finalists": 2, "repetitions": 2, "warm_prefix_trial": True,
+        "decode_speed_tolerance": .05, "minimum_prefix_cache_hit_ratio": .8,
+        "gateway_session_table_size": 10000, "gateway_session_ttl_s": 86400,
         "smoke_repetitions": 3, "request_timeout_s": 7200,
         "idle_timeout_s": 300, "latency_budgets": {"ttft_s": 300, "max_useful_gap_s": 120},
         "minimum_free_gib": 3, "progress_interval_s": 15,
@@ -59,10 +63,17 @@ def read_config(path: Path) -> dict:
     for key in ("cache_dir", "api_key_file", "reports_dir"):
         config[key] = str((path.parent / config[key]).resolve())
     validate_config(config)
+    validate_port_layout(config)
     for key in ("screen_input_tokens", "screen_output_tokens", "refine_input_tokens", "refine_output_tokens",
                 "finalists", "repetitions", "smoke_repetitions", "request_timeout_s", "idle_timeout_s", "progress_interval_s"):
         if type(config[key]) is not int or config[key] <= 0:
             raise ValueError(key + " must be a positive integer")
+    if type(config["decode_speed_tolerance"]) not in (int, float) or not 0 <= config["decode_speed_tolerance"] <= .1:
+        raise ValueError("decode_speed_tolerance must be between 0 and 0.1")
+    if type(config["minimum_prefix_cache_hit_ratio"]) not in (int, float) or not .5 <= config["minimum_prefix_cache_hit_ratio"] <= 1:
+        raise ValueError("minimum_prefix_cache_hit_ratio must be between 0.5 and 1")
+    if config["warm_prefix_trial"] is not True:
+        raise ValueError("warm_prefix_trial must remain enabled for session-cache qualification")
     if config["repetitions"] < 2 or config["smoke_repetitions"] < 2:
         raise ValueError("qualification requires at least two repeated workload and smoke trials")
     if config["target_input_tokens"] < 260000 or config["output_tokens"] < 32768:
@@ -100,34 +111,6 @@ def init_config(path: Path):
     print("Created", path, "and API key file", key_path, "(key not printed).")
 
 
-def cost(workload: dict) -> float:
-    """Compare successful runs of the same workload; all terms are costs."""
-    if not workload.get("passed"):
-        return math.inf
-    long = [r for r in workload["requests"] if r["request"] < workload["concurrency"]]
-    short = [r for r in workload["requests"] if r["request"] >= workload["concurrency"]]
-    if not long or not short:
-        return math.inf
-    rates = [r.get("output_tokens_per_second") for r in long]
-    if any(not isinstance(v, (float, int)) or not math.isfinite(v) or v <= 0 for v in rates):
-        return math.inf
-    terms = [(1 / min(rates), .50), (max(r["ttft_s"] for r in long), .25),
-             (max(r["ttft_s"] for r in short), .15),
-             (max(r["max_useful_gap_s"] for r in workload["requests"]), .10)]
-    return math.exp(sum(weight * math.log(max(value, .000001)) for value, weight in terms))
-
-
-def shortlist(results: list[dict], count: int, preserve_bf16=True) -> list[dict]:
-    eligible = sorted((r for r in results if r.get("passed") and type(r.get("score")) in (float, int)
-                       and math.isfinite(r["score"]) and r["score"] > 0), key=lambda r: r["score"])
-    selected = eligible[:count]
-    # Keep a full-precision reference through the expensive stages when possible.
-    baseline = next((r for r in eligible if r["candidate"]["precision"] == "bf16"), None)
-    if preserve_bf16 and count > 1 and baseline and baseline not in selected:
-        selected[-1:] = [baseline]
-    return selected
-
-
 def fixture_url() -> str:
     return "data:video/mp4;base64," + base64.b64encode((ROOT / "fixtures/red-blue.mp4").read_bytes()).decode()
 
@@ -143,6 +126,24 @@ def recover_tree(directory: Path):
         recover_gateway(manifest.parent)
     for manifest in directory.rglob("runtime.json"):
         recover_runtime(manifest.parent)
+
+
+def compare_report(directory: Path):
+    """Inspect saved results without loading GPUs, changing a winner, or writing files."""
+    state = json.loads((directory / "run.json").read_text())
+    comparisons = []
+    for name, result in state.get("results", {}).items():
+        try:
+            metrics = describe(result.get("trials", []))
+        except (ValueError, KeyError, TypeError) as exc:
+            metrics = {"unavailable": str(exc)}
+        comparisons.append({"stage_candidate": name, "passed_original_checks": result.get("passed", False),
+                            "candidate": result.get("candidate"), "measured_metrics": metrics,
+                            "session_cache_qualified": bool(result.get("ranking", {}).get("policy") == POLICY
+                                and result.get("passed") and result.get("stage") == "qualify")})
+    print(json.dumps({"read_only": True, "original_winner": state.get("winner"),
+        "note": "Per-user measurements, not the legacy blended score. This does not qualify or deploy an old winner under the new routing policy.",
+        "results": comparisons}, indent=2, allow_nan=False))
 
 
 def hardware_identity(topology) -> dict:
@@ -213,14 +214,18 @@ def evaluate(config: dict, candidate: Candidate, stage: str, directory: Path, pr
                 atomic_json(directory / "result.json", result)
                 if not trial["passed"]:
                     raise RuntimeError("Concurrent workload failed; see per-request metrics")
-            if stage == "qualify" and config["warm_prefix_trial"]:
-                progress.update(activity={"event": "reused_prefix_trial"})
-                warm = client.run_workload(input_tokens, output_tokens, seed=seed,
-                                           reasoning_effort=config["reasoning_effort"])
-                warm["cache_mode"] = "reused_prefix"
-                result["trials"].append(warm)
-                if not warm["passed"]:
-                    raise RuntimeError("Reused-prefix workload failed")
+                if stage == "qualify":
+                    progress.update(activity={"event": "session_followup_trial", "repetition": repetition + 1})
+                    warm = client.run_followup_workload(input_tokens, config["refine_output_tokens"], seed=seed,
+                        reasoning_effort=config["reasoning_effort"], max_model_len=config["max_model_len"])
+                    warm["cache_mode"] = "growing_followup"
+                    result["trials"].append(warm)
+                    if not warm["passed"]:
+                        raise RuntimeError("Growing-conversation workload or session affinity failed")
+                    warm["prefix_cache"] = assess_cache(warm, config["minimum_prefix_cache_hit_ratio"])
+                    atomic_json(directory / "result.json", result)
+                    if not warm["prefix_cache"]["passed"]:
+                        raise RuntimeError("Growing conversations did not reuse sufficient cached prefix tokens")
         result["telemetry"] = telemetry.summary(config["minimum_free_gib"])
         if not result["telemetry"]["passed"]:
             raise RuntimeError("VRAM headroom, metrics, or no-preemption gate failed")
@@ -232,8 +237,8 @@ def evaluate(config: dict, candidate: Candidate, stage: str, directory: Path, pr
                                       "acceptance": accepted / drafted if drafted else None}
             if drafted <= 0:
                 raise RuntimeError("Speculation requested but no draft tokens observed")
-        scores = [cost(t) for t in result["trials"] if t["cache_mode"] == "distinct_prefix"]
-        score = statistics.median(scores)
+        result["ranking"] = describe(result["trials"])
+        score = result["ranking"]["seconds_per_output_token"]
         if not math.isfinite(score):
             raise RuntimeError("Missing or invalid ranking metrics")
         result.update(passed=True, score=score)
@@ -278,6 +283,7 @@ def tune(config: dict, resume: Path | None = None, retry_failed=False) -> Path:
         state = {"schema": 1, "fingerprint": signature, "config": config, "results": {}, "status": "running"}
         atomic_json(state_path, state)
     try:
+        check_ports(config, backend_count=3 if "replicas" in config["layouts"] else 1)
         current = hardware_identity(detect_gpus(config))
         if state.get("hardware") and state["hardware"] != current:
             raise RuntimeError("Hardware/driver/topology changed; create a new run")
@@ -306,22 +312,29 @@ def tune(config: dict, resume: Path | None = None, retry_failed=False) -> Path:
             return results
         try:
             screen = stage("screen", [c for c in candidates if c.draft_tokens == 0])
-            selected = shortlist(screen, config["finalists"])
+            selected = shortlist(screen, config["finalists"], preserve_layouts=True,
+                                 speed_tolerance=config["decode_speed_tolerance"])
             if not selected:
                 raise RuntimeError("No candidate passed screening; no deployment will be exported")
             identities = {(r["candidate"]["precision"], r["candidate"]["layout"], r["candidate"]["chunk_size"]) for r in selected}
             refined = stage("refine", [c for c in candidates if (c.precision, c.layout, c.chunk_size) in identities])
-            finalists = [Candidate(**r["candidate"]) for r in shortlist(refined, config["finalists"])]
+            finalists = [Candidate(**r["candidate"]) for r in shortlist(refined, config["finalists"], preserve_layouts=True,
+                            speed_tolerance=config["decode_speed_tolerance"])]
             if not finalists:
                 raise RuntimeError("No candidate passed refinement")
             qualified = stage("qualify", finalists)
-            ranked = shortlist(qualified, len(qualified), preserve_bf16=False)
+            ranked = shortlist(qualified, len(qualified), preserve_bf16=False,
+                               speed_tolerance=config["decode_speed_tolerance"])
             if not ranked:
                 raise RuntimeError("No candidate passed full qualification; no production recommendation")
             state.update(status="completed", winner=ranked[0]["candidate"])
             recommendation = {"schema": 1, "fingerprint": signature, "config": config,
                 "hardware": state["hardware"], "candidate": state["winner"],
                 "qualification": ranked[0], "report_directory": str(directory.resolve()),
+                "selection_policy": {"name": POLICY, "decode_speed_tolerance": config["decode_speed_tolerance"],
+                    "primary": "slower-user generation rate across cold trials",
+                    "near_speed_ties": "warm TTFT, cold TTFT, useful gap, third-request TTFT"},
+                "qualified_comparison": [{"candidate": r["candidate"], "ranking": r.get("ranking")} for r in ranked],
                 "scope": "Synthetic protocol, multimodal, retrieval and load qualification; not a general intelligence benchmark."}
             atomic_json(directory / "recommendation.json", recommendation)
             progress.update(status="completed", stage="completed", candidate=state["winner"]["id"])
@@ -342,6 +355,8 @@ def serve(report: Path, config: dict, port: int):
         raise RuntimeError("Config/source differs from qualified recommendation; rerun qualification")
     if not recommendation.get("qualification", {}).get("passed"):
         raise RuntimeError("Recommendation is not qualified")
+    check_ports(config, backend_count=1 if recommendation["candidate"]["layout"] == "tp2" else 3,
+                gateway_port=port)
     topology = detect_gpus(config)
     if hardware_identity(topology) != recommendation["hardware"]:
         raise RuntimeError("Hardware/driver differs from the qualified run")
@@ -385,12 +400,17 @@ def main(argv=None) -> int:
     run.add_argument("--retry-failed", action="store_true", help="Retry failed records in a resumed run; keep successful records")
     cleanup = commands.add_parser("cleanup")
     cleanup.add_argument("directory", type=Path)
+    comparison = commands.add_parser("compare", help="Read saved per-user rates without starting containers or changing a recommendation")
+    comparison.add_argument("directory", type=Path)
     deployment = commands.add_parser("serve")
     deployment.add_argument("recommendation", type=Path)
     deployment.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
     if args.command == "init":
         init_config(args.config.resolve())
+        return 0
+    if args.command == "compare":
+        compare_report(args.directory.resolve())
         return 0
     if args.command == "status":
         active = ROOT / "state/active.json"
@@ -432,8 +452,9 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGTERM, interrupt)
     with exclusive(REPO / ".gpu-benchmark.lock"):
         if args.command == "preflight":
+            ports = check_ports(config, backend_count=3 if "replicas" in config["layouts"] else 1)
             topology = detect_gpus(config)
-            print(json.dumps(topology.to_dict(), indent=2))
+            print(json.dumps({**topology.to_dict(), "ports": ports}, indent=2))
             subprocess.run(["docker", "info", "--format", "{{.ServerVersion}}"], check=True, timeout=30)
         elif args.command == "download":
             # Target hardware guard comes before any image/model transfer.

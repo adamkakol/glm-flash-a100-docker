@@ -7,3 +7,7 @@ __pycache__/
 *.zip
 deployment.json
 .autotune.lock
+.gpu-benchmark.lock
+models/*/config.json
+models/*/state/
+models/*/runtime-*.env

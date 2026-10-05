@@ -1,4 +1,20 @@
-# GLM-5.3-Flash on three A100 80GB GPUs
+# Model deployments on three A100 80GB GPUs
+
+| Model | Deployment and evaluation |
+|---|---|
+| GLM-5.3-Flash | [Model folder and existing deployment](models/glm-5.3-flash/README.md) |
+| Qwen3.8-27B | [vLLM deployment benchmark and operational guide](models/qwen3.8-27b/README.md) |
+
+The Qwen benchmark compares the NVLink pair against independent GPU replicas,
+then qualifies finalists with two 260k-input sessions plus generation. It is
+isolated from the original GLM deployment. Stop the existing GPU workload before
+benchmarking. Model weights are downloaded only by an explicit command on the
+A100 server.
+
+## Existing GLM-5.3-Flash deployment
+
+The original GLM files and commands remain at the repository root to preserve
+existing installations. New model tooling lives in its own `models/` folder.
 
 Deploy `turboderp/GLM-5.3-Flash-exl3` **4.05bpw** with pinned **ExLlamaV3 1.5.1,
 TabbyAPI, and PyTorch 2.9.0 / CUDA 12.8**. Two of the three cards are connected

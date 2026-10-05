@@ -249,6 +249,10 @@ Older/newer client model metadata can also require a custom model catalogue.
 
 From the repository root, without GPUs or weights:
 
+The existing GLM tests additionally require PyYAML and ffmpeg. The Qwen host
+tests use the Python standard library; Docker is only needed for the optional
+real proxy tests.
+
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s models/qwen3.8-27b/tests -v
